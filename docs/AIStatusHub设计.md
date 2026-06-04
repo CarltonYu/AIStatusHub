@@ -324,8 +324,10 @@ MVP 阶段可以合并为一个 Tauri/Electron 应用，内部启动本地 HTTP/
 
 推荐：
 
-- MVP 用 TypeScript 更快。
-- 后期如果对常驻稳定性、低资源占用、BLE 跨平台更重视，可以迁移核心 daemon 到 Rust。
+- 当前实施路线采用 Rust 优先。
+- 原因是 AIStatusHub 需要长期常驻、低资源占用、多平台单文件可执行，并且希望用户只配置一个 `config.toml` 即可使用。
+- TypeScript 仍可作为未来复杂 Web UI 或开发工具链的候选，但不作为 daemon MVP 的默认技术栈。
+- 默认不使用 SQLite 事件库；只维护当前状态，必要时以小型 JSON snapshot 落地。
 
 ## 6. 内部数据模型
 
@@ -491,13 +493,26 @@ PATCH /api/v1/outputs/:id
 [server]
 host = "127.0.0.1"
 port = 17888
-auth_token_env = "AI_STATUS_HUB_TOKEN"
+auth_token = "dev-local-token"
 
-[storage]
-sqlite_path = "aistatushub.sqlite3"
-retain_days = 30
-store_raw_events = true
+[hub]
+hub_id = "hub_auto_generated"
+display_name = "My Laptop"
+accept_remote_hubs = false
+max_hops = 5
+
+[privacy]
+store_raw_events = false
 store_prompt_text = false
+hash_workspace = true
+max_preview_length = 180
+
+[state]
+activity_ring_size = 300
+snapshot_enabled = true
+snapshot_path = "state.snapshot.json"
+snapshot_debounce_ms = 1000
+remote_state_ttl_ms = 120000
 
 [[adapters]]
 id = "claude-code"
@@ -527,6 +542,12 @@ api_key_env = "MIMO_API_KEY"
 id = "desktop-ui"
 type = "ui"
 enabled = true
+
+[[trusted_hubs]]
+hub_id = "hub_desktop_01"
+display_name = "Desktop"
+token = "shared-secret"
+allow_relay = true
 
 [[outputs]]
 id = "lan-websocket"
@@ -728,16 +749,16 @@ M5Stack 按键可以回传：
 
 第一版建议只做这些：
 
-1. 本机 daemon。
-2. SQLite 存储。
+1. Rust 本机 daemon，编译为单个可执行程序。
+2. 内存当前状态存储，可选 JSON snapshot。
 3. HTTP ingest API。
 4. WebSocket event stream。
-5. Web UI dashboard。
+5. 极简内嵌 Web UI dashboard。
 6. Claude Code hook adapter。
 7. Codex hook adapter。
 8. Kimi Code hook adapter。
-9. 简单 webhook output。
-10. 配置文件和启动脚本。
+9. Hub-to-Hub 当前状态同步。
+10. 一个 `config.toml` 配置文件即可启动。
 
 暂不做：
 
@@ -962,23 +983,22 @@ process.stdin.on("end", async () => {
 创建 GitHub 项目后，第一批 issue 可以这样拆：
 
 1. 初始化 monorepo。
-2. 实现 daemon HTTP ingest API。
+2. 初始化 Rust 单二进制 daemon。
 3. 定义 AIEvent 和 AITaskState schema。
-4. 实现 SQLite 存储。
+4. 实现内存当前状态存储和 JSON snapshot。
 5. 实现 WebSocket state stream。
-6. 实现 Web UI Overview 页面。
+6. 实现极简内嵌 Web UI Overview 页面。
 7. 添加 Codex hook 示例。
 8. 添加 Claude Code hook 示例。
 9. 添加 Kimi Code hook 示例。
-10. 添加 webhook output。
+10. 添加 Hub-to-Hub 当前状态同步。
 11. 编写安全与隐私文档。
 12. 设计 M5Stack BLE payload。
 
 推荐先完成一个非常小但能跑通的闭环：
 
 ```text
-Codex hook → AIStatusHub ingest API → Web UI 实时显示 → WebSocket 输出
+Codex hook → AIStatusHub ingest API → 内存当前状态 → Web UI 实时显示
 ```
 
-闭环跑通后，再逐个增加 Claude Code、Kimi Code、Hermes proxy、M5Stack。
-
+闭环跑通后，再逐个增加 Claude Code、Kimi Code、Hub-to-Hub 汇聚、Hermes proxy、M5Stack。

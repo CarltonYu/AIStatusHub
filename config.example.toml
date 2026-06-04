@@ -1,0 +1,39 @@
+[server]
+host = "127.0.0.1"
+port = 17888
+auth_token = "dev-local-token"
+
+[hub]
+hub_id = "hub_auto_generated"
+display_name = "My Laptop"
+accept_remote_hubs = false
+max_hops = 5
+
+[privacy]
+store_raw_events = false
+store_prompt_text = false
+hash_workspace = true
+max_preview_length = 180
+
+[state]
+activity_ring_size = 300
+snapshot_enabled = true
+snapshot_path = "state.snapshot.json"
+snapshot_debounce_ms = 1000
+remote_state_ttl_ms = 120000
+
+[[trusted_hubs]]
+hub_id = "hub_desktop_01"
+display_name = "Desktop"
+token = "shared-secret"
+allow_relay = true
+
+[[outputs]]
+id = "home-server"
+type = "hub-forward"
+enabled = false
+url = "http://192.168.1.10:17888/api/v1/hub/state"
+target_hub_id = "hub_home_server_01"
+token = "shared-secret"
+send_snapshot_on_start = true
+include_remote_states = false
