@@ -1,8 +1,10 @@
 mod api;
+mod cli;
 mod config;
 mod hub;
 mod ingest;
 mod model;
+mod outputs;
 mod security;
 mod snapshot;
 mod state;
@@ -16,6 +18,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if cli::is_report_command() {
+        cli::run_report_command().await?;
+        return Ok(());
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -35,9 +42,12 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state = api::AppState::new(Arc::new(config), store);
     let app = api::router(app_state.clone());
-    let addr: SocketAddr = format!("{}:{}", app_state.config.server.host, app_state.config.server.port)
-        .parse()
-        .context("invalid server host/port")?;
+    let addr: SocketAddr = format!(
+        "{}:{}",
+        app_state.config.server.host, app_state.config.server.port
+    )
+    .parse()
+    .context("invalid server host/port")?;
     let listener = TcpListener::bind(addr).await?;
 
     tracing::info!(

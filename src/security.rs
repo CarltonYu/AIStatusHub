@@ -8,7 +8,10 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-pub fn require_token(headers: &HeaderMap, expected: Option<&str>) -> Result<(), axum::response::Response> {
+pub fn require_token(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> Result<(), axum::response::Response> {
     let Some(expected) = expected else {
         return Ok(());
     };

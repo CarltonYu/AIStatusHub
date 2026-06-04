@@ -3,6 +3,8 @@
 Thumbs.db
 temp/
 .env
+config.toml
 target/
+logs/
 state.snapshot.json
 aistatushub.toml

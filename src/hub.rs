@@ -143,7 +143,11 @@ fn validate_path(provenance: &HubProvenance, config: &AppConfig) -> Result<(), H
         return Err(HubMergeError::EmptyPath);
     }
 
-    if provenance.hub_path.iter().any(|hop| hop.hub_id == config.hub.hub_id) {
+    if provenance
+        .hub_path
+        .iter()
+        .any(|hop| hop.hub_id == config.hub.hub_id)
+    {
         return Err(HubMergeError::LoopDetected);
     }
 
@@ -155,10 +159,7 @@ fn validate_path(provenance: &HubProvenance, config: &AppConfig) -> Result<(), H
         return Err(HubMergeError::MaxHopsExceeded);
     }
 
-    if provenance
-        .hub_path
-        .first()
-        .map(|hop| hop.hub_id.as_str())
+    if provenance.hub_path.first().map(|hop| hop.hub_id.as_str())
         != Some(provenance.origin_hub_id.as_str())
     {
         return Err(HubMergeError::OriginMismatch);

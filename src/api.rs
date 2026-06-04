@@ -1,25 +1,29 @@
 use std::sync::Arc;
 
 use axum::{
+    body::{Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 use crate::{
     config::AppConfig,
     hub,
     ingest::{activity_from_state, normalize_event, reduce_event},
-    model::{ActivityItem, HubMessageType, HubPeer, HubStateEnvelope, IngestEventRequest},
-    security,
-    snapshot,
+    model::{
+        ActivityItem, EventType, HubMessageType, HubStateEnvelope, IngestEventRequest, Status,
+    },
+    outputs, security, snapshot,
     state::{ServerEvent, StateFilter, StateStore},
     web,
 };
@@ -55,6 +59,10 @@ struct HubSnapshotRequest {
     items: Vec<HubStateEnvelope>,
 }
 
+const OPENAI_PROXY_SURFACE: &str = "openai-compatible-proxy";
+const ANTHROPIC_PROXY_SURFACE: &str = "anthropic-compatible-proxy";
+const KIMI_PROXY_SURFACE: &str = "kimi-openai-compatible-proxy";
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -68,6 +76,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ingest/event", post(ingest_event))
         .route("/api/v1/hub/state", post(hub_state))
         .route("/api/v1/hub/snapshot", post(hub_snapshot))
+        .route("/anthropic/v1/messages", post(proxy_anthropic_messages))
+        .route("/anthropic/*proxy_path", any(proxy_anthropic_path))
+        .route("/kimi/v1/chat/completions", post(proxy_kimi_chat_completions))
+        .route("/kimi/v1/models", get(proxy_kimi_models))
+        .route("/kimi/v1/*proxy_path", any(proxy_kimi_v1_path))
+        .route("/v1/chat/completions", post(proxy_chat_completions))
+        .route("/v1/models", get(proxy_models))
+        .route("/v1/*proxy_path", any(proxy_v1_path))
         .with_state(state)
 }
 
@@ -157,7 +173,6 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
             ServerEvent::StateDeleted { key } => json!({ "type": "state.deleted", "key": key }),
             ServerEvent::Activity(data) => json!({ "type": "activity", "data": data }),
             ServerEvent::HubUpdated(data) => json!({ "type": "hub.updated", "data": data }),
-            ServerEvent::Heartbeat => json!({ "type": "heartbeat" }),
         };
 
         if socket
@@ -177,7 +192,9 @@ async fn ingest_event(
     headers: HeaderMap,
     Json(payload): Json<IngestEventRequest>,
 ) -> Response {
-    if let Err(response) = security::require_token(&headers, state.config.server.auth_token.as_deref()) {
+    if let Err(response) =
+        security::require_token(&headers, state.config.server.auth_token.as_deref())
+    {
         return response;
     }
 
@@ -186,7 +203,11 @@ async fn ingest_event(
         &event.provenance.origin_hub_id,
         &event.source,
         event.workspace_hash.as_deref(),
-        event.session_id.as_deref().or(event.turn_id.as_deref()).or(Some(&event.id)),
+        event
+            .session_id
+            .as_deref()
+            .or(event.turn_id.as_deref())
+            .or(Some(&event.id)),
     );
     let previous = state.store.get_state(&previous_key).await;
     let task_state = reduce_event(previous, &event);
@@ -199,6 +220,7 @@ async fn ingest_event(
     state.store.add_activity(activity).await;
 
     if changed {
+        outputs::emit_state_upsert(&state.config, &task_state);
         save_snapshot_best_effort(&state).await;
     }
 
@@ -208,6 +230,1012 @@ async fn ingest_event(
         "state_changed": changed
     }))
     .into_response()
+}
+
+async fn proxy_chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "OpenAI-compatible proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_upstream_base_url(&state, &headers) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy upstream_base_url is not configured",
+        );
+    };
+
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let stream = payload
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let source = proxy_source(&state, &headers);
+    let session_id = format!("proxy_{}", uuid::Uuid::new_v4());
+    let started = Instant::now();
+
+    let _ = apply_internal_event(
+        &state,
+        IngestEventRequest {
+            source: source.clone(),
+            surface: Some(OPENAI_PROXY_SURFACE.to_string()),
+            workspace: None,
+            workspace_hash: Some("proxy".to_string()),
+            session_id: Some(session_id.clone()),
+            turn_id: None,
+            event_type: EventType::PromptSubmitted,
+            status: Some(Status::Thinking),
+            model: model.clone(),
+            tool: None,
+            message: Some(format!(
+                "Proxy request started{}",
+                model
+                    .as_ref()
+                    .map(|model| format!(" for {model}"))
+                    .unwrap_or_default()
+            )),
+            metrics: Default::default(),
+            severity: Default::default(),
+            created_at: None,
+        },
+    )
+    .await;
+
+    if stream {
+        let _ = apply_internal_event(
+            &state,
+            IngestEventRequest {
+                source: source.clone(),
+                surface: Some(OPENAI_PROXY_SURFACE.to_string()),
+                workspace: None,
+                workspace_hash: Some("proxy".to_string()),
+                session_id: Some(session_id.clone()),
+                turn_id: None,
+                event_type: EventType::MessageDelta,
+                status: Some(Status::Streaming),
+                model: model.clone(),
+                tool: None,
+                message: Some("Proxy streaming response".to_string()),
+                metrics: Default::default(),
+                severity: Default::default(),
+                created_at: None,
+            },
+        )
+        .await;
+    }
+
+    let upstream_url = format!(
+        "{}/chat/completions",
+        upstream_base_url.trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let mut request = client.post(upstream_url).json(&payload);
+    request = apply_proxy_headers(request, &headers, &state);
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = proxy_finish_event(
+                &state,
+                OPENAI_PROXY_SURFACE,
+                &source,
+                &session_id,
+                model,
+                Status::Error,
+                format!("Proxy request failed: {error}"),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    if stream && status.is_success() {
+        let stream_state = state.clone();
+        let stream_source = source.clone();
+        let stream_session_id = session_id.clone();
+        let stream_model = model.clone();
+        let stream_started = started;
+        let body_stream = async_stream::stream! {
+            let mut chunks = upstream.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                match chunk {
+                    Ok(bytes) => yield Ok::<Bytes, reqwest::Error>(bytes),
+                    Err(error) => {
+                        let _ = proxy_finish_event(
+                            &stream_state,
+                            OPENAI_PROXY_SURFACE,
+                            &stream_source,
+                            &stream_session_id,
+                            stream_model.clone(),
+                            Status::Error,
+                            format!("Proxy stream failed: {error}"),
+                            stream_started.elapsed().as_millis() as u64,
+                        )
+                        .await;
+                        yield Err::<Bytes, reqwest::Error>(error);
+                        return;
+                    }
+                }
+            }
+
+            let _ = proxy_finish_event(
+                &stream_state,
+                OPENAI_PROXY_SURFACE,
+                &stream_source,
+                &stream_session_id,
+                stream_model,
+                Status::Completed,
+                format!("Proxy stream completed with HTTP {status}"),
+                stream_started.elapsed().as_millis() as u64,
+            )
+            .await;
+        };
+
+        let mut response = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                response = response.header(header::CONTENT_TYPE, value);
+            }
+        }
+
+        return response
+            .body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to build proxy response",
+                )
+            });
+    }
+
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = proxy_finish_event(
+                &state,
+                OPENAI_PROXY_SURFACE,
+                &source,
+                &session_id,
+                model,
+                Status::Error,
+                format!("Proxy response read failed: {error}"),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+    };
+    let final_status = if status.is_success() {
+        Status::Completed
+    } else {
+        Status::Error
+    };
+    let _ = proxy_finish_event(
+        &state,
+        OPENAI_PROXY_SURFACE,
+        &source,
+        &session_id,
+        model,
+        final_status,
+        format!("Proxy response completed with HTTP {status}"),
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+
+    let mut response = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        if let Ok(value) = HeaderValue::from_str(&content_type) {
+            response = response.header(header::CONTENT_TYPE, value);
+        }
+    }
+
+    response.body(Body::from(bytes)).unwrap_or_else(|_| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build proxy response",
+        )
+    })
+}
+
+async fn proxy_anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Anthropic proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_anthropic_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy anthropic_upstream_base_url is not configured",
+        );
+    };
+
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let stream = payload
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let source = proxy_anthropic_source(&state);
+    let session_id = format!("proxy_{}", uuid::Uuid::new_v4());
+    let started = Instant::now();
+
+    let _ = apply_internal_event(
+        &state,
+        IngestEventRequest {
+            source: source.clone(),
+            surface: Some(ANTHROPIC_PROXY_SURFACE.to_string()),
+            workspace: None,
+            workspace_hash: Some("proxy".to_string()),
+            session_id: Some(session_id.clone()),
+            turn_id: None,
+            event_type: EventType::PromptSubmitted,
+            status: Some(Status::Thinking),
+            model: model.clone(),
+            tool: None,
+            message: Some(format!(
+                "Anthropic proxy request started{}",
+                model
+                    .as_ref()
+                    .map(|model| format!(" for {model}"))
+                    .unwrap_or_default()
+            )),
+            metrics: Default::default(),
+            severity: Default::default(),
+            created_at: None,
+        },
+    )
+    .await;
+
+    if stream {
+        let _ = apply_internal_event(
+            &state,
+            IngestEventRequest {
+                source: source.clone(),
+                surface: Some(ANTHROPIC_PROXY_SURFACE.to_string()),
+                workspace: None,
+                workspace_hash: Some("proxy".to_string()),
+                session_id: Some(session_id.clone()),
+                turn_id: None,
+                event_type: EventType::MessageDelta,
+                status: Some(Status::Streaming),
+                model: model.clone(),
+                tool: None,
+                message: Some("Anthropic proxy streaming response".to_string()),
+                metrics: Default::default(),
+                severity: Default::default(),
+                created_at: None,
+            },
+        )
+        .await;
+    }
+
+    let upstream_url = anthropic_upstream_url(&upstream_base_url, "v1/messages", "");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let mut request = client.post(upstream_url).json(&payload);
+    request = apply_proxy_headers(request, &headers, &state);
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = proxy_finish_event(
+                &state,
+                ANTHROPIC_PROXY_SURFACE,
+                &source,
+                &session_id,
+                model,
+                Status::Error,
+                format!("Anthropic proxy request failed: {error}"),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let content_type_is_stream = content_type
+        .as_deref()
+        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false);
+
+    if status.is_success() && (stream || content_type_is_stream) {
+        let stream_state = state.clone();
+        let stream_source = source.clone();
+        let stream_session_id = session_id.clone();
+        let stream_model = model.clone();
+        let stream_started = started;
+        let body_stream = async_stream::stream! {
+            let mut chunks = upstream.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                match chunk {
+                    Ok(bytes) => yield Ok::<Bytes, reqwest::Error>(bytes),
+                    Err(error) => {
+                        let _ = proxy_finish_event(
+                            &stream_state,
+                            ANTHROPIC_PROXY_SURFACE,
+                            &stream_source,
+                            &stream_session_id,
+                            stream_model.clone(),
+                            Status::Error,
+                            format!("Anthropic proxy stream failed: {error}"),
+                            stream_started.elapsed().as_millis() as u64,
+                        )
+                        .await;
+                        yield Err::<Bytes, reqwest::Error>(error);
+                        return;
+                    }
+                }
+            }
+
+            let _ = proxy_finish_event(
+                &stream_state,
+                ANTHROPIC_PROXY_SURFACE,
+                &stream_source,
+                &stream_session_id,
+                stream_model,
+                Status::Completed,
+                format!("Anthropic proxy stream completed with HTTP {status}"),
+                stream_started.elapsed().as_millis() as u64,
+            )
+            .await;
+        };
+
+        let mut response = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                response = response.header(header::CONTENT_TYPE, value);
+            }
+        }
+
+        return response
+            .body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to build proxy response",
+                )
+            });
+    }
+
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = proxy_finish_event(
+                &state,
+                ANTHROPIC_PROXY_SURFACE,
+                &source,
+                &session_id,
+                model,
+                Status::Error,
+                format!("Anthropic proxy response read failed: {error}"),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+    };
+    let final_status = if status.is_success() {
+        Status::Completed
+    } else {
+        Status::Error
+    };
+    let _ = proxy_finish_event(
+        &state,
+        ANTHROPIC_PROXY_SURFACE,
+        &source,
+        &session_id,
+        model,
+        final_status,
+        format!("Anthropic proxy response completed with HTTP {status}"),
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+
+    let mut response = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        if let Ok(value) = HeaderValue::from_str(&content_type) {
+            response = response.header(header::CONTENT_TYPE, value);
+        }
+    }
+
+    response.body(Body::from(bytes)).unwrap_or_else(|_| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build proxy response",
+        )
+    })
+}
+
+async fn proxy_kimi_chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Kimi proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_kimi_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy kimi_upstream_base_url is not configured",
+        );
+    };
+
+    let source = proxy_kimi_source(&state);
+    proxy_openai_chat_request(
+        state,
+        headers,
+        payload,
+        upstream_base_url,
+        source,
+        KIMI_PROXY_SURFACE,
+        "Kimi proxy",
+    )
+    .await
+}
+
+async fn proxy_openai_chat_request(
+    state: AppState,
+    headers: HeaderMap,
+    payload: serde_json::Value,
+    upstream_base_url: String,
+    source: String,
+    surface: &'static str,
+    label: &'static str,
+) -> Response {
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let stream = payload
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let session_id = format!("proxy_{}", uuid::Uuid::new_v4());
+    let started = Instant::now();
+
+    let _ = apply_internal_event(
+        &state,
+        IngestEventRequest {
+            source: source.clone(),
+            surface: Some(surface.to_string()),
+            workspace: None,
+            workspace_hash: Some("proxy".to_string()),
+            session_id: Some(session_id.clone()),
+            turn_id: None,
+            event_type: EventType::PromptSubmitted,
+            status: Some(Status::Thinking),
+            model: model.clone(),
+            tool: None,
+            message: Some(format!(
+                "{label} request started{}",
+                model
+                    .as_ref()
+                    .map(|model| format!(" for {model}"))
+                    .unwrap_or_default()
+            )),
+            metrics: Default::default(),
+            severity: Default::default(),
+            created_at: None,
+        },
+    )
+    .await;
+
+    if stream {
+        let _ = apply_internal_event(
+            &state,
+            IngestEventRequest {
+                source: source.clone(),
+                surface: Some(surface.to_string()),
+                workspace: None,
+                workspace_hash: Some("proxy".to_string()),
+                session_id: Some(session_id.clone()),
+                turn_id: None,
+                event_type: EventType::MessageDelta,
+                status: Some(Status::Streaming),
+                model: model.clone(),
+                tool: None,
+                message: Some(format!("{label} streaming response")),
+                metrics: Default::default(),
+                severity: Default::default(),
+                created_at: None,
+            },
+        )
+        .await;
+    }
+
+    let upstream_url = format!(
+        "{}/chat/completions",
+        upstream_base_url.trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let mut request = client.post(upstream_url).json(&payload);
+    request = apply_proxy_headers(request, &headers, &state);
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = proxy_finish_event(
+                &state,
+                surface,
+                &source,
+                &session_id,
+                model,
+                Status::Error,
+                format!("{label} request failed: {error}"),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    if stream && status.is_success() {
+        let stream_state = state.clone();
+        let stream_source = source.clone();
+        let stream_session_id = session_id.clone();
+        let stream_model = model.clone();
+        let stream_started = started;
+        let body_stream = async_stream::stream! {
+            let mut chunks = upstream.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                match chunk {
+                    Ok(bytes) => yield Ok::<Bytes, reqwest::Error>(bytes),
+                    Err(error) => {
+                        let _ = proxy_finish_event(
+                            &stream_state,
+                            surface,
+                            &stream_source,
+                            &stream_session_id,
+                            stream_model.clone(),
+                            Status::Error,
+                            format!("{label} stream failed: {error}"),
+                            stream_started.elapsed().as_millis() as u64,
+                        )
+                        .await;
+                        yield Err::<Bytes, reqwest::Error>(error);
+                        return;
+                    }
+                }
+            }
+
+            let _ = proxy_finish_event(
+                &stream_state,
+                surface,
+                &stream_source,
+                &stream_session_id,
+                stream_model,
+                Status::Completed,
+                format!("{label} stream completed with HTTP {status}"),
+                stream_started.elapsed().as_millis() as u64,
+            )
+            .await;
+        };
+
+        let mut response = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                response = response.header(header::CONTENT_TYPE, value);
+            }
+        }
+
+        return response
+            .body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to build proxy response",
+                )
+            });
+    }
+
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = proxy_finish_event(
+                &state,
+                surface,
+                &source,
+                &session_id,
+                model,
+                Status::Error,
+                format!("{label} response read failed: {error}"),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+    };
+    let final_status = if status.is_success() {
+        Status::Completed
+    } else {
+        Status::Error
+    };
+    let _ = proxy_finish_event(
+        &state,
+        surface,
+        &source,
+        &session_id,
+        model,
+        final_status,
+        format!("{label} response completed with HTTP {status}"),
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+
+    let mut response = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        if let Ok(value) = HeaderValue::from_str(&content_type) {
+            response = response.header(header::CONTENT_TYPE, value);
+        }
+    }
+
+    response.body(Body::from(bytes)).unwrap_or_else(|_| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build proxy response",
+        )
+    })
+}
+
+async fn proxy_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "OpenAI-compatible proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_upstream_base_url(&state, &headers) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy upstream_base_url is not configured",
+        );
+    };
+    let client = reqwest::Client::new();
+    let mut request = client.get(format!(
+        "{}/models",
+        upstream_base_url.trim_end_matches('/')
+    ));
+    request = apply_proxy_headers(request, &headers, &state);
+
+    match request.send().await {
+        Ok(response) => {
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+            };
+            let mut builder = Response::builder().status(status);
+            if let Some(content_type) = content_type {
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    builder = builder.header(header::CONTENT_TYPE, value);
+                }
+            }
+            builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to build proxy response",
+                )
+            })
+        }
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn proxy_kimi_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Kimi proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_kimi_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy kimi_upstream_base_url is not configured",
+        );
+    };
+    let client = reqwest::Client::new();
+    let mut request = client.get(format!(
+        "{}/models",
+        upstream_base_url.trim_end_matches('/')
+    ));
+    request = apply_proxy_headers(request, &headers, &state);
+
+    match request.send().await {
+        Ok(response) => {
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+            };
+            let mut builder = Response::builder().status(status);
+            if let Some(content_type) = content_type {
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    builder = builder.header(header::CONTENT_TYPE, value);
+                }
+            }
+            builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to build proxy response",
+                )
+            })
+        }
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn proxy_v1_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    Path(proxy_path): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "OpenAI-compatible proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_upstream_base_url(&state, &headers) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy upstream_base_url is not configured",
+        );
+    };
+
+    let clean_path = proxy_path.trim_start_matches('/');
+    if clean_path.is_empty() || clean_path.contains("..") {
+        return json_error(StatusCode::BAD_REQUEST, "invalid proxy path");
+    }
+
+    let query = uri
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    let upstream_url = format!(
+        "{}/{}{}",
+        upstream_base_url.trim_end_matches('/'),
+        clean_path,
+        query
+    );
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+
+    let mut request = client.request(reqwest_method, upstream_url);
+    request = apply_proxy_headers(request, &headers, &state);
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    match request.send().await {
+        Ok(response) => proxy_response(response, false).await,
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn proxy_kimi_v1_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    Path(proxy_path): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Kimi proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_kimi_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy kimi_upstream_base_url is not configured",
+        );
+    };
+
+    let clean_path = proxy_path.trim_start_matches('/');
+    if clean_path.is_empty() || clean_path.contains("..") {
+        return json_error(StatusCode::BAD_REQUEST, "invalid proxy path");
+    }
+
+    let query = uri
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    let upstream_url = format!(
+        "{}/{}{}",
+        upstream_base_url.trim_end_matches('/'),
+        clean_path,
+        query
+    );
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+
+    let mut request = client.request(reqwest_method, upstream_url);
+    request = apply_proxy_headers(request, &headers, &state);
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    match request.send().await {
+        Ok(response) => proxy_response(response, false).await,
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn proxy_anthropic_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    Path(proxy_path): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Anthropic proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_anthropic_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy anthropic_upstream_base_url is not configured",
+        );
+    };
+
+    let clean_path = proxy_path.trim_start_matches('/');
+    if clean_path.is_empty() || clean_path.contains("..") {
+        return json_error(StatusCode::BAD_REQUEST, "invalid proxy path");
+    }
+
+    let query = uri
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    let upstream_url = anthropic_upstream_url(&upstream_base_url, clean_path, &query);
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+
+    let mut request = client.request(reqwest_method, upstream_url);
+    request = apply_proxy_headers(request, &headers, &state);
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    match request.send().await {
+        Ok(response) => proxy_response(response, false).await,
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn proxy_response(upstream: reqwest::Response, prefer_stream: bool) -> Response {
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let should_stream = prefer_stream
+        || content_type
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+            .unwrap_or(false);
+
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        if let Ok(value) = HeaderValue::from_str(&content_type) {
+            builder = builder.header(header::CONTENT_TYPE, value);
+        }
+    }
+
+    if should_stream {
+        return builder
+            .body(Body::from_stream(upstream.bytes_stream()))
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to build proxy response",
+                )
+            });
+    }
+
+    match upstream.bytes().await {
+        Ok(bytes) => builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build proxy response",
+            )
+        }),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
 }
 
 async fn hub_state(
@@ -252,15 +1280,18 @@ async fn handle_hub_envelope(
 
     match envelope.message_type {
         HubMessageType::Heartbeat => {
-            state.store.add_activity(ActivityItem {
-                id: format!("act_{}", uuid::Uuid::new_v4()),
-                kind: "heartbeat".to_string(),
-                message: Some(format!("Heartbeat from {}", envelope.sender_hub.hub_id)),
-                source: None,
-                origin_hub_id: Some(envelope.sender_hub.hub_id),
-                state_key: None,
-                created_at: crate::ingest::now_iso(),
-            }).await;
+            state
+                .store
+                .add_activity(ActivityItem {
+                    id: format!("act_{}", uuid::Uuid::new_v4()),
+                    kind: "heartbeat".to_string(),
+                    message: Some(format!("Heartbeat from {}", envelope.sender_hub.hub_id)),
+                    source: None,
+                    origin_hub_id: Some(envelope.sender_hub.hub_id),
+                    state_key: None,
+                    created_at: crate::ingest::now_iso(),
+                })
+                .await;
             Json(json!({ "changed": false })).into_response()
         }
         HubMessageType::ActivityCompact => {
@@ -275,6 +1306,7 @@ async fn handle_hub_envelope(
             };
             let changed = state.store.delete_state(&incoming.key).await;
             if changed {
+                outputs::emit_state_delete(&state.config, &incoming.key);
                 save_snapshot_best_effort(&state).await;
             }
             Json(json!({ "changed": changed, "task_key": incoming.key })).into_response()
@@ -295,18 +1327,264 @@ async fn handle_hub_envelope(
             if changed_count > 0 {
                 save_snapshot_best_effort(&state).await;
             }
-            Json(json!({ "changed": changed_count > 0, "changed_count": changed_count })).into_response()
+            Json(json!({ "changed": changed_count > 0, "changed_count": changed_count }))
+                .into_response()
         }
-        HubMessageType::StateUpsert => match merge_one_remote_state(&state, trusted.as_ref(), envelope).await {
-            Ok(changed) => {
-                if changed {
-                    save_snapshot_best_effort(&state).await;
+        HubMessageType::StateUpsert => {
+            match merge_one_remote_state(&state, trusted.as_ref(), envelope).await {
+                Ok(changed) => {
+                    if changed {
+                        save_snapshot_best_effort(&state).await;
+                    }
+                    Json(json!({ "changed": changed })).into_response()
                 }
-                Json(json!({ "changed": changed })).into_response()
+                Err(response) => response,
             }
-            Err(response) => response,
-        },
+        }
     }
+}
+
+async fn apply_internal_event(state: &AppState, payload: IngestEventRequest) -> (String, bool) {
+    let event = normalize_event(payload, &state.config);
+    let previous_key = crate::ingest::task_key(
+        &event.provenance.origin_hub_id,
+        &event.source,
+        event.workspace_hash.as_deref(),
+        event
+            .session_id
+            .as_deref()
+            .or(event.turn_id.as_deref())
+            .or(Some(&event.id)),
+    );
+    let previous = state.store.get_state(&previous_key).await;
+    let task_state = reduce_event(previous, &event);
+    let changed = state.store.upsert_state(task_state.clone()).await;
+    let activity = activity_from_state(
+        event_type_name(&event.event_type),
+        &task_state,
+        event.message.clone(),
+    );
+    state.store.add_activity(activity).await;
+
+    if changed {
+        outputs::emit_state_upsert(&state.config, &task_state);
+        save_snapshot_best_effort(state).await;
+    }
+
+    (task_state.key, changed)
+}
+
+async fn proxy_finish_event(
+    state: &AppState,
+    surface: &str,
+    source: &str,
+    session_id: &str,
+    model: Option<String>,
+    status: Status,
+    message: String,
+    latency_ms: u64,
+) -> (String, bool) {
+    apply_internal_event(
+        state,
+        IngestEventRequest {
+            source: source.to_string(),
+            surface: Some(surface.to_string()),
+            workspace: None,
+            workspace_hash: Some("proxy".to_string()),
+            session_id: Some(session_id.to_string()),
+            turn_id: None,
+            event_type: if status == Status::Error {
+                EventType::TurnFailed
+            } else {
+                EventType::TurnCompleted
+            },
+            status: Some(status),
+            model,
+            tool: None,
+            message: Some(message),
+            metrics: crate::model::Metrics {
+                latency_ms: Some(latency_ms),
+                ..Default::default()
+            },
+            severity: Default::default(),
+            created_at: None,
+        },
+    )
+    .await
+}
+
+fn apply_proxy_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers.iter() {
+        if !should_forward_proxy_header(name.as_str(), state) {
+            continue;
+        }
+
+        let Ok(header_name) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
+        else {
+            continue;
+        };
+        let Ok(header_value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) else {
+            continue;
+        };
+        request = request.header(header_name, header_value);
+    }
+
+    if let Some(api_key) = configured_proxy_api_key(state) {
+        request = request.bearer_auth(api_key);
+    } else if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        request = request.header(reqwest::header::AUTHORIZATION, auth);
+    }
+
+    request
+}
+
+fn should_forward_proxy_header(name: &str, state: &AppState) -> bool {
+    if name.eq_ignore_ascii_case(state.config.proxy.source_header.trim())
+        || name.eq_ignore_ascii_case(state.config.proxy.upstream_base_url_header.trim())
+    {
+        return false;
+    }
+
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "connection"
+            | "content-length"
+            | "host"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn proxy_upstream_base_url(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let header_name = state.config.proxy.upstream_base_url_header.trim();
+    if !header_name.is_empty() {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+        {
+            let value = value.trim().trim_end_matches('/');
+            if is_valid_upstream_base_url(value) {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    state
+        .config
+        .proxy
+        .upstream_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+}
+
+fn proxy_anthropic_upstream_base_url(state: &AppState) -> Option<String> {
+    state
+        .config
+        .proxy
+        .anthropic_upstream_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| is_valid_upstream_base_url(value))
+        .map(ToOwned::to_owned)
+}
+
+fn proxy_kimi_upstream_base_url(state: &AppState) -> Option<String> {
+    state
+        .config
+        .proxy
+        .kimi_upstream_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| is_valid_upstream_base_url(value))
+        .map(ToOwned::to_owned)
+}
+
+fn anthropic_upstream_url(base_url: &str, path: &str, query: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let clean_path = path.trim_start_matches('/');
+    let clean_path = if base.ends_with("/v1") {
+        clean_path.strip_prefix("v1/").unwrap_or(clean_path)
+    } else {
+        clean_path
+    };
+    format!("{base}/{clean_path}{query}")
+}
+
+fn is_valid_upstream_base_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .map(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .unwrap_or(false)
+}
+
+fn proxy_source(state: &AppState, headers: &HeaderMap) -> String {
+    let header_name = state.config.proxy.source_header.trim();
+    if !header_name.is_empty() {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+        {
+            let value = value.trim();
+            if is_valid_source_label(value) {
+                return value.to_string();
+            }
+        }
+    }
+
+    state.config.proxy.source.clone()
+}
+
+fn proxy_anthropic_source(state: &AppState) -> String {
+    let value = state.config.proxy.anthropic_source.trim();
+    if is_valid_source_label(value) {
+        value.to_string()
+    } else {
+        "vscode-claude-code".to_string()
+    }
+}
+
+fn proxy_kimi_source(state: &AppState) -> String {
+    let value = state.config.proxy.kimi_source.trim();
+    if is_valid_source_label(value) {
+        value.to_string()
+    } else {
+        "vscode-kimi-code".to_string()
+    }
+}
+
+fn is_valid_source_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn configured_proxy_api_key(state: &AppState) -> Option<&str> {
+    state
+        .config
+        .proxy
+        .api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
 }
 
 async fn merge_one_remote_state(
@@ -331,6 +1609,7 @@ async fn merge_one_remote_state(
     let changed = app.store.upsert_state(merged.clone()).await;
 
     if changed {
+        outputs::emit_state_upsert(&app.config, &merged);
         app.store
             .add_activity(activity_from_state(
                 "remote.state.updated",

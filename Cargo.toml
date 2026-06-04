@@ -9,7 +9,10 @@ description = "A lightweight local status hub for AI coding tools."
 anyhow = "1"
 axum = { version = "0.7", features = ["ws"] }
 directories = "5"
+async-stream = "0.3"
+futures-util = "0.3"
 hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

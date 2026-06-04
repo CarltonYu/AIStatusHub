@@ -20,6 +20,9 @@ aistatushub
   ├─ optional compact state snapshot
   ├─ Hub-to-Hub receiver
   ├─ Hub-to-Hub forwarder
+  ├─ stdout print output
+  ├─ report subcommand
+  ├─ OpenAI-compatible proxy
   └─ minimal built-in web page
 ```
 
@@ -145,11 +148,30 @@ snapshot_path = "state.snapshot.json"
 snapshot_debounce_ms = 1000
 remote_state_ttl_ms = 120000
 
+[proxy]
+enabled = false
+source = "hermes-agent"
+anthropic_source = "vscode-claude-code"
+kimi_source = "vscode-kimi-code"
+source_header = "x-aistatushub-source"
+upstream_base_url_header = "x-aistatushub-upstream-base-url"
+upstream_base_url = "https://api.example.com/v1"
+anthropic_upstream_base_url = "https://api.anthropic.com"
+kimi_upstream_base_url = "https://api.kimi.com/coding/v1"
+api_key = ""
+timeout_secs = 120
+
 [[trusted_hubs]]
 hub_id = "hub_desktop_01"
 display_name = "Desktop"
 token = "shared-secret"
 allow_relay = true
+
+[[outputs]]
+id = "console"
+type = "stdout"
+enabled = true
+format = "json"
 
 [[outputs]]
 id = "home-server"
@@ -357,6 +379,60 @@ POST /api/v1/hub/state
 POST /api/v1/hub/snapshot
 ```
 
+### 9.5 OpenAI-Compatible Proxy
+
+用于 Hermes Agent / Mimo 等 OpenAI-compatible 客户端：
+
+```http
+POST /v1/chat/completions
+GET /v1/models
+ANY /v1/{path}
+```
+
+代理行为：
+
+- 请求开始时写入 `source = "hermes-agent"`、`status = thinking`。
+- 如果请求带 `x-aistatushub-source`，使用该值覆盖默认 `source`，用于区分 `vscode-codex`、`hermes-agent` 等来源。
+- 如果请求带 `x-aistatushub-upstream-base-url`，使用该值作为本次请求上游；这两个内部头不会继续透传到上游。
+- 如果请求体 `stream = true`，额外写入 `status = streaming`，并对上游流式响应做直通转发。
+- 非流式 upstream 返回后写入 `completed` 或 `error`；流式响应结束后写入 `completed`，读取失败则写入 `error`。
+- `/v1/{path}` 用于兼容 Hermes Agent 可能调用的其他 OpenAI-compatible 路径，默认只转发，不记录正文。
+- 默认不保存 prompt 和 response 正文，只记录模型名、状态、延迟和 HTTP 结果摘要。
+
+### 9.6 VSCode 插件接入
+
+当前测试机使用的 VSCode AI 入口不是 Continue，而是：
+
+- ClaudeCode 插件调用 Opus：配置 `claudeCode.environmentVariables` 中的 `ANTHROPIC_BASE_URL = "http://127.0.0.1:17888/anthropic"`。AIStatusHub 转发 `POST /anthropic/v1/messages` 到 `proxy.anthropic_upstream_base_url`，状态来源为 `proxy.anthropic_source`。
+- VSCode Codex 插件调用 GPT：使用项目级 `.codex/config.toml` hooks 自动上报。插件在本仓库内启动 Codex 时复用 Codex hook 机制。
+- Kimi Code 插件调用 Kimi：配置 `kimi.environmentVariables.KIMI_BASE_URL = "http://127.0.0.1:17888/kimi/v1"`。AIStatusHub 转发 `/kimi/v1/chat/completions` 到 `proxy.kimi_upstream_base_url`，状态来源为 `proxy.kimi_source`。
+
+VSCode 插件代理路径：
+
+```http
+POST /anthropic/v1/messages
+ANY /anthropic/{path}
+
+POST /kimi/v1/chat/completions
+GET /kimi/v1/models
+ANY /kimi/v1/{path}
+```
+
+其中 `/anthropic/v1/messages` 和 `/kimi/v1/chat/completions` 会记录状态；通用透传路径默认只负责兼容插件启动或辅助请求。
+
+### 9.7 Reporter 子命令
+
+用于 Codex hooks、VSCode tasks 和手动测试：
+
+```bash
+aistatushub report --source vscode-claude-code --event-type prompt.submitted --status thinking
+aistatushub report --source vscode-codex --event-type prompt.submitted --status thinking
+aistatushub report --source vscode-kimi-code --event-type prompt.submitted --status thinking
+aistatushub report --codex-hook --quiet
+```
+
+`--codex-hook` 从 stdin 读取 Codex hook JSON，并映射为 AIStatusHub 事件。
+
 ## 10. 实施顺序
 
 ### Milestone 0：Rust 项目骨架
@@ -379,6 +455,11 @@ POST /api/v1/hub/snapshot
 - 实现 `POST /api/v1/ingest/event`。
 - 实现 `GET /api/v1/state`。
 - 实现 `GET /api/v1/activity`。
+- 实现 `stdout` output，状态更新时打印 compact JSON。
+- 实现 `report` 子命令，便于 Codex/VSCode 测试。
+- 实现 `/v1/chat/completions`、`/v1/models` 和 `/v1/{path}` proxy，便于 Hermes/Mimo 测试。
+- 实现 `/anthropic/v1/messages` proxy，便于 VSCode ClaudeCode/Opus 测试。
+- 实现 `/kimi/v1/chat/completions`、`/kimi/v1/models` 和 `/kimi/v1/{path}` proxy，便于 VSCode Kimi Code 测试。
 
 ### Milestone 3：Hub-to-Hub 接收
 

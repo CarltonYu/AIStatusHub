@@ -1,0 +1,212 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "AIStatusHub: ClaudeCode started",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-claude-code",
+        "--event-type",
+        "prompt.submitted",
+        "--status",
+        "thinking",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_claude_manual",
+        "--message",
+        "VSCode ClaudeCode request started",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: ClaudeCode completed",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-claude-code",
+        "--event-type",
+        "turn.completed",
+        "--status",
+        "completed",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_claude_manual",
+        "--message",
+        "VSCode ClaudeCode request completed",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: ClaudeCode error",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-claude-code",
+        "--event-type",
+        "turn.failed",
+        "--status",
+        "error",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_claude_manual",
+        "--message",
+        "VSCode ClaudeCode request failed",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: Codex started",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-codex",
+        "--event-type",
+        "prompt.submitted",
+        "--status",
+        "thinking",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_codex_manual",
+        "--message",
+        "VSCode Codex request started",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: Codex completed",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-codex",
+        "--event-type",
+        "turn.completed",
+        "--status",
+        "completed",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_codex_manual",
+        "--message",
+        "VSCode Codex request completed",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: Codex error",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-codex",
+        "--event-type",
+        "turn.failed",
+        "--status",
+        "error",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_codex_manual",
+        "--message",
+        "VSCode Codex request failed",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: Kimi started",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-kimi-code",
+        "--event-type",
+        "prompt.submitted",
+        "--status",
+        "thinking",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_kimi_manual",
+        "--message",
+        "VSCode Kimi request started",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: Kimi completed",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-kimi-code",
+        "--event-type",
+        "turn.completed",
+        "--status",
+        "completed",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_kimi_manual",
+        "--message",
+        "VSCode Kimi request completed",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "AIStatusHub: Kimi error",
+      "type": "shell",
+      "command": "${workspaceFolder}\\target\\debug\\aistatushub.exe",
+      "args": [
+        "report",
+        "--source",
+        "vscode-kimi-code",
+        "--event-type",
+        "turn.failed",
+        "--status",
+        "error",
+        "--workspace",
+        "${workspaceFolder}",
+        "--session-id",
+        "vscode_kimi_manual",
+        "--message",
+        "VSCode Kimi request failed",
+        "--token",
+        "dev-local-token"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

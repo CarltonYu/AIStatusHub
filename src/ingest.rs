@@ -4,8 +4,8 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     model::{
-        ActivityItem, AiEvent, EventType, HubHop, HubProvenance, IngestEventRequest,
-        Locality, Severity, Status, TaskState,
+        ActivityItem, AiEvent, EventType, HubHop, HubProvenance, IngestEventRequest, Locality,
+        Severity, Status, TaskState,
     },
 };
 
@@ -17,10 +17,12 @@ pub fn now_iso() -> String {
 
 pub fn normalize_event(input: IngestEventRequest, config: &AppConfig) -> AiEvent {
     let now = input.created_at.clone().unwrap_or_else(now_iso);
-    let workspace_hash = input
-        .workspace_hash
-        .clone()
-        .or_else(|| input.workspace.as_ref().map(|workspace| hash_workspace(workspace)));
+    let workspace_hash = input.workspace_hash.clone().or_else(|| {
+        input
+            .workspace
+            .as_ref()
+            .map(|workspace| hash_workspace(workspace))
+    });
 
     AiEvent {
         id: format!("evt_{}", Uuid::new_v4()),
@@ -36,7 +38,9 @@ pub fn normalize_event(input: IngestEventRequest, config: &AppConfig) -> AiEvent
         status: input.status,
         model: input.model,
         tool: input.tool,
-        message: input.message.map(|value| preview(&value, config.privacy.max_preview_length)),
+        message: input
+            .message
+            .map(|value| preview(&value, config.privacy.max_preview_length)),
         metrics: input.metrics,
         severity: input.severity,
         created_at: now,
@@ -69,16 +73,26 @@ pub fn reduce_event(previous: Option<TaskState>, event: &AiEvent) -> TaskState {
             .tool
             .as_ref()
             .map(|tool| tool.name.clone())
-            .or_else(|| previous.as_ref().and_then(|state| state.active_tool.clone())),
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|state| state.active_tool.clone())
+            }),
         EventType::ToolCompleted | EventType::TurnCompleted => None,
-        _ => previous.as_ref().and_then(|state| state.active_tool.clone()),
+        _ => previous
+            .as_ref()
+            .and_then(|state| state.active_tool.clone()),
     };
 
     let key = task_key(
         &event.provenance.origin_hub_id,
         &event.source,
         event.workspace_hash.as_deref(),
-        event.session_id.as_deref().or(event.turn_id.as_deref()).or(Some(&event.id)),
+        event
+            .session_id
+            .as_deref()
+            .or(event.turn_id.as_deref())
+            .or(Some(&event.id)),
     );
 
     TaskState {
@@ -103,10 +117,11 @@ pub fn reduce_event(previous: Option<TaskState>, event: &AiEvent) -> TaskState {
             .or_else(|| previous.as_ref().and_then(|state| state.model.clone())),
         status,
         active_tool,
-        last_message: event
-            .message
-            .clone()
-            .or_else(|| previous.as_ref().and_then(|state| state.last_message.clone())),
+        last_message: event.message.clone().or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|state| state.last_message.clone())
+        }),
         counters,
         started_at: previous
             .as_ref()
@@ -118,7 +133,12 @@ pub fn reduce_event(previous: Option<TaskState>, event: &AiEvent) -> TaskState {
     }
 }
 
-pub fn task_key(origin_hub_id: &str, source: &str, workspace_hash: Option<&str>, id: Option<&str>) -> String {
+pub fn task_key(
+    origin_hub_id: &str,
+    source: &str,
+    workspace_hash: Option<&str>,
+    id: Option<&str>,
+) -> String {
     format!(
         "{}:{}:{}:{}",
         sanitize(origin_hub_id),

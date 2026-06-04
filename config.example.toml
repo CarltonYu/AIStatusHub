@@ -4,7 +4,7 @@ port = 17888
 auth_token = "dev-local-token"
 
 [hub]
-hub_id = "hub_auto_generated"
+hub_id = "hub_e9627070-320f-4664-99f8-a5c83d5e9d8c"
 display_name = "My Laptop"
 accept_remote_hubs = false
 max_hops = 5
@@ -22,11 +22,28 @@ snapshot_path = "state.snapshot.json"
 snapshot_debounce_ms = 1000
 remote_state_ttl_ms = 120000
 
+[proxy]
+enabled = false
+source = "hermes-agent"
+source_header = "x-aistatushub-source"
+upstream_base_url_header = "x-aistatushub-upstream-base-url"
+upstream_base_url = "https://api.example.com/v1"
+api_key = ""
+timeout_secs = 120
+
 [[trusted_hubs]]
 hub_id = "hub_desktop_01"
 display_name = "Desktop"
 token = "shared-secret"
 allow_relay = true
+
+[[outputs]]
+id = "console"
+type = "stdout"
+enabled = true
+format = "json"
+send_snapshot_on_start = false
+include_remote_states = false
 
 [[outputs]]
 id = "home-server"

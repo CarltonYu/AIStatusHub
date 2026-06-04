@@ -21,7 +21,6 @@ pub enum ServerEvent {
     StateDeleted { key: String },
     Activity(ActivityItem),
     HubUpdated(HubPeer),
-    Heartbeat,
 }
 
 #[derive(Debug, Default)]

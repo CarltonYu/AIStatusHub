@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -19,6 +18,8 @@ pub struct AppConfig {
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub state: StateConfig,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     #[serde(default)]
     pub trusted_hubs: Vec<TrustedHubConfig>,
     #[serde(default)]
@@ -137,10 +138,51 @@ pub struct OutputConfig {
     pub url: Option<String>,
     pub target_hub_id: Option<String>,
     pub token: Option<String>,
+    pub format: Option<String>,
     #[serde(default)]
     pub send_snapshot_on_start: bool,
     #[serde(default)]
     pub include_remote_states: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_proxy_source")]
+    pub source: String,
+    #[serde(default = "default_proxy_anthropic_source")]
+    pub anthropic_source: String,
+    #[serde(default = "default_proxy_kimi_source")]
+    pub kimi_source: String,
+    #[serde(default = "default_proxy_source_header")]
+    pub source_header: String,
+    #[serde(default = "default_proxy_upstream_base_url_header")]
+    pub upstream_base_url_header: String,
+    pub upstream_base_url: Option<String>,
+    pub anthropic_upstream_base_url: Option<String>,
+    pub kimi_upstream_base_url: Option<String>,
+    pub api_key: Option<String>,
+    #[serde(default = "default_proxy_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: default_proxy_source(),
+            anthropic_source: default_proxy_anthropic_source(),
+            kimi_source: default_proxy_kimi_source(),
+            source_header: default_proxy_source_header(),
+            upstream_base_url_header: default_proxy_upstream_base_url_header(),
+            upstream_base_url: None,
+            anthropic_upstream_base_url: None,
+            kimi_upstream_base_url: None,
+            api_key: None,
+            timeout_secs: default_proxy_timeout_secs(),
+        }
+    }
 }
 
 pub fn config_path_from_args() -> PathBuf {
@@ -168,8 +210,8 @@ pub fn load_or_create_config(path: &Path) -> Result<AppConfig> {
 
     let text = fs::read_to_string(path)
         .with_context(|| format!("unable to read config {}", path.display()))?;
-    let mut config: AppConfig = toml::from_str(&text)
-        .with_context(|| format!("invalid config {}", path.display()))?;
+    let mut config: AppConfig =
+        toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
     config.config_path = path.to_path_buf();
     ensure_hub_id(&mut config, false)?;
 
@@ -206,6 +248,7 @@ impl Default for AppConfig {
             hub: HubConfig::default(),
             privacy: PrivacyConfig::default(),
             state: StateConfig::default(),
+            proxy: ProxyConfig::default(),
             trusted_hubs: Vec::new(),
             outputs: Vec::new(),
             config_path: PathBuf::from("config.toml"),
@@ -261,4 +304,28 @@ fn default_snapshot_debounce_ms() -> u64 {
 
 fn default_remote_state_ttl_ms() -> u64 {
     120_000
+}
+
+fn default_proxy_source() -> String {
+    "hermes-agent".to_string()
+}
+
+fn default_proxy_anthropic_source() -> String {
+    "vscode-claude-code".to_string()
+}
+
+fn default_proxy_kimi_source() -> String {
+    "vscode-kimi-code".to_string()
+}
+
+fn default_proxy_source_header() -> String {
+    "x-aistatushub-source".to_string()
+}
+
+fn default_proxy_upstream_base_url_header() -> String {
+    "x-aistatushub-upstream-base-url".to_string()
+}
+
+fn default_proxy_timeout_secs() -> u64 {
+    120
 }

@@ -2,7 +2,10 @@ use std::fs;
 
 use anyhow::{Context, Result};
 
-use crate::{config::AppConfig, state::{SnapshotData, StateStore}};
+use crate::{
+    config::AppConfig,
+    state::{SnapshotData, StateStore},
+};
 
 pub async fn restore_snapshot(config: &AppConfig, store: &StateStore) -> Result<()> {
     if !config.state.snapshot_enabled || !config.state.snapshot_path.exists() {
