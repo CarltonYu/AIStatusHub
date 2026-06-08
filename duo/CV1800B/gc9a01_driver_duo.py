@@ -2,17 +2,54 @@
 # gc9a01_driver_duo.py - 适配 Milkv Duo CV1800B
 
 import spidev
-import gpiozero
 from PIL import Image, ImageDraw
+import os
+import subprocess
 import time
 
-# === 根据实际接线修改 ===
-PIN_DC = 3      # GP3 (5号脚) - 数据/命令
-PIN_RST = 8     # GP8 (11号脚) - 复位
-PIN_CS = 9      # GP9 (12号脚) - 片选
+# 官方镜像上优先使用 c-gc9a01/test_hw_spi.c 做点屏验证。
+# Python 版本保留为原型程序，使用 sysfs GPIO，避免依赖 gpiozero。
+PIN_DC = 377     # Pin5  = GP3 = PWR_GPIO[25]
+PIN_RST = 373    # Pin11 = GP8 = PWR_GPIO[21]
+PIN_CS = 370     # Pin12 = GP9 = PWR_GPIO[18]
 
-SPI_BUS = 0     # 尝试 0 或 1
+SPI_BUS = 0      # /dev/spidev0.0 = SPI2 on the tested official image
 SPI_DEVICE = 0
+SPI_SPEED_HZ = 8000000
+
+
+def configure_pinmux():
+    for mux in ("GP3/GP3", "GP6/SPI2_SCK", "GP7/SPI2_SDO", "GP8/GP8", "GP9/GP9"):
+        subprocess.run(
+            ["duo-pinmux", "-w", mux],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+class SysfsGPIO:
+    def __init__(self, pin):
+        self.pin = pin
+        self.path = f"/sys/class/gpio/gpio{pin}"
+        if not os.path.exists(self.path):
+            with open("/sys/class/gpio/export", "w") as f:
+                f.write(str(pin))
+            time.sleep(0.1)
+        with open(f"{self.path}/direction", "w") as f:
+            f.write("out")
+        self.value = open(f"{self.path}/value", "w")
+
+    def set(self, value):
+        self.value.seek(0)
+        self.value.write("1" if value else "0")
+        self.value.flush()
+
+    def on(self):
+        self.set(1)
+
+    def off(self):
+        self.set(0)
 
 class GC9A01_Duo:
     # GC9A01 命令
@@ -26,18 +63,18 @@ class GC9A01_Duo:
     MADCTL = 0x36
     
     def __init__(self):
-        # 使用 gpiozero 控制 GPIO (通过 sysfs)
-        # 注意：Duo 的 GPIO 编号是 480 + GPx (XGPIOA 起始)
-        # GP3 = 480 + 3 = 483? 不对，需要确认实际编号
-        # 先尝试直接用 gpiod 或 sysfs 方式
-        
-        self.dc = gpiozero.LED("GPIO3")   # GP3
-        self.rst = gpiozero.LED("GPIO8")  # GP8
-        self.cs = gpiozero.LED("GPIO9")   # GP9
+        configure_pinmux()
+
+        self.dc = SysfsGPIO(PIN_DC)
+        self.rst = SysfsGPIO(PIN_RST)
+        self.cs = SysfsGPIO(PIN_CS)
+        self.cs.on()
+        self.dc.on()
+        self.rst.on()
         
         self.spi = spidev.SpiDev()
         self.spi.open(SPI_BUS, SPI_DEVICE)
-        self.spi.max_speed_hz = 20000000  # 20MHz，Duo 可能不支持太高
+        self.spi.max_speed_hz = SPI_SPEED_HZ
         self.spi.mode = 0
         
         self.width = 240
@@ -48,20 +85,23 @@ class GC9A01_Duo:
         time.sleep(0.2)
         self.rst.on()
         time.sleep(0.2)
+
+    def write_bytes(self, data):
+        if isinstance(data, int):
+            data = [data]
+        for off in range(0, len(data), 512):
+            self.spi.xfer2(data[off:off + 512], SPI_SPEED_HZ, 0, 8)
         
     def write_cmd(self, cmd, data=None):
         self.cs.off()
         self.dc.off()  # Command
-        self.spi.writebytes([cmd])
+        self.write_bytes([cmd])
         self.cs.on()
         
-        if data:
+        if data is not None:
             self.cs.off()
             self.dc.on()  # Data
-            if isinstance(data, list):
-                self.spi.writebytes(data)
-            else:
-                self.spi.writebytes([data])
+            self.write_bytes(data)
             self.cs.on()
             
     def init(self):

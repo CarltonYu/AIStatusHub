@@ -1,0 +1,82 @@
+# GC9A01 round LCD driver for MilkV Duo (CV1800B)
+
+This directory contains small C test programs for a 240x240 GC9A01 SPI LCD.
+
+## Current Wiring
+
+The current wiring matches Duo SPI2 for the data pins:
+
+| LCD pin | Duo physical pin | Duo name | Linux/sysfs GPIO | Use |
+|---------|------------------|----------|------------------|-----|
+| VCC | Pin 36 | 3V3(OUT) | - | Power |
+| GND | GND | GND | - | Ground |
+| SCL | Pin 9 | GP6 / SPI2_SCK | 375 | SPI clock |
+| SDA | Pin 10 | GP7 / SPI2_SDO | 374 | SPI MOSI |
+| DC | Pin 5 | GP3 | 377 | Data/command GPIO |
+| CS | Pin 12 | GP9 | 370 | Manual chip-select GPIO |
+| RST | Pin 11 | GP8 | 373 | Reset GPIO |
+
+`test_hw_spi.c` uses `/dev/spidev0.0` for SPI2 clock/MOSI on the tested
+official image and controls
+DC/CS/RST through sysfs GPIO.
+
+## Important Pinmux Detail
+
+The official Duo image may boot with:
+
+- `GP3` as `UART4_RX`
+- `GP8` as `SPI2_SDI`
+- `GP9` as `SPI2_CS_X`
+
+For this wiring, the program must switch:
+
+```bash
+duo-pinmux -w GP3/GP3
+duo-pinmux -w GP6/SPI2_SCK
+duo-pinmux -w GP7/SPI2_SDO
+duo-pinmux -w GP8/GP8
+duo-pinmux -w GP9/GP9
+```
+
+The current `test_hw_spi.c` does this automatically before opening GPIOs.
+
+## Build
+
+On macOS, build with Zig:
+
+```bash
+cd duo/CV1800B/c-gc9a01
+make test-hw-spi
+```
+
+## Copy To Duo
+
+The official image uses Dropbear. Use legacy SCP mode:
+
+```bash
+sshpass -p "milkv" scp -O test-hw-spi root@192.168.42.1:/root/
+```
+
+## Run
+
+```bash
+sshpass -p "milkv" ssh root@192.168.42.1 /root/test-hw-spi
+```
+
+The test cycles red, green, blue, then white.
+
+On the official image, this warning is expected and harmless:
+
+```text
+SPI_IOC_WR_MODE with SPI_NO_CS: Invalid argument
+warning: falling back to SPI_MODE_0 with manual GPIO CS
+```
+
+The kernel rejects `SPI_NO_CS`, so the program falls back to normal SPI mode
+while still driving the LCD CS line through GPIO370.
+
+## Legacy Files
+
+`gc9a01.c`, `gc9a01.h`, `main.c`, `test_init.c`, and `test_full_init.c` are
+older software-SPI experiments. They are useful as references for the GC9A01
+initialization sequence, but they are not the current recommended test path.
