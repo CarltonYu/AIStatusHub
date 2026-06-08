@@ -1,0 +1,5 @@
+[submodule "duo/CV1800B/duo-buildroot-sdk"]
+	path = duo/CV1800B/duo-buildroot-sdk
+	url = https://github.com/milkv-duo/duo-buildroot-sdk.git
+	branch = develop
+	ignore = dirty
