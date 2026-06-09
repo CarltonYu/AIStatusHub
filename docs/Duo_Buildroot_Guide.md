@@ -1,280 +1,281 @@
-# MilkV Duo Buildroot 编译指南（macOS → Linux 模拟器）
+# MilkV Duo (CV1800B) 镜像编译指南
 
-## 目标
+## 概述
 
-在 macOS 上通过 Docker 运行 Linux，编译自定义的 MilkV Duo Buildroot 镜像，解决以下问题：
+在 **macOS x86_64** 上通过 **Lima VM** (Ubuntu 22.04) 编译 MilkV Duo 的自定义 Buildroot SD 卡镜像。
 
-1. **spidev 缓冲区太小** → 240×240 眼睛动画只能跑 ~15 FPS
-2. **内存分配** → 小核只留 1MB，其余全给 Linux 大核
-3. **摄像头内存不划分** → ION/CMA 已关闭，overlay 已清理
-
-## 已完成的 SDK 修改
-
-以下修改已在 `duo/CV1800B/duo-buildroot-sdk` 中完成，无需在 Linux 中再次修改：
-
-### 1. spidev 缓冲区增大
-**文件**: `linux_5.10/drivers/spi/spidev.c`  
-**修改**: `bufsiz` 从 `4096` → `65536`
-
-```c
-static unsigned bufsiz = 65536;  /* Increased for GC9A01 240x240 SPI frame transfers */
-```
-
-这样 `eye-anim` 传 240×240 帧（115200 字节）时只需 **1 次 ioctl**，配合 20MHz SPI 可稳定 **30+ FPS**。
-
-### 2. 小核内存缩减
-**文件**: `build/boards/cv180x/cv1800b_milkv_duo_sd/memmap.py`  
-**修改**: `FREERTOS_SIZE` 从 `8 * SIZE_1M` → `1 * SIZE_1M`
-
-```python
-FREERTOS_SIZE = 1 * SIZE_1M  # Minimal FreeRTOS region; Linux gets 63MB
-```
-
-- 总 DRAM: 64MB
-- FreeRTOS (小核): 1MB
-- Linux (大核): **63MB**
-
-### 3. 摄像头/多媒体内存关闭
-**文件**: `build/boards/cv180x/cv1800b_milkv_duo_sd/memmap.py`  
-**状态**: 已关闭（`ION_SIZE = 0` 等）
-
-**文件**: `build/boards/cv180x/cv1800b_milkv_duo_sd/linux/cvitek_cv1800b_milkv_duo_sd_defconfig`  
-**状态**: 已关闭
-
-```
-# CONFIG_CMA is not set
-# CONFIG_ION is not set
-# CONFIG_DMA_CMA is not set
-```
-
-**overlay 状态**: `device/milkv-duo-sd/overlay` 中无 camera/ISP/VENC 相关文件。
+**核心修改：**
+- `spidev.bufsiz=65536`：支持单帧 240×240 SPI 传输
+- `FREERTOS_SIZE=1MB`：小核只留 1MB，Linux 大核得 63MB
+- ION/CMA 关闭：不分配摄像头多媒体内存
+- **GC9A01 / ST7789V framebuffer 驱动**：内核原生支持，接入即出 `/dev/fb0`
 
 ---
 
-## 环境准备：macOS → Docker Linux
+## 1. 环境准备
 
-### 1. 安装 Docker Desktop
+### 1.1 宿主机 (macOS)
 
 ```bash
-brew install --cask docker
-# 或者从 https://www.docker.com/products/docker-desktop 下载
+# 安装 Lima
+brew install lima
+
+# 启动 Ubuntu 22.04 VM（首次会自动下载镜像）
+limactl start --name=duo-builder template://ubuntu-lts
+
+# 进入 VM
+limactl shell duo-builder
 ```
 
-启动 Docker Desktop，确保状态栏图标显示 🐳 且状态为 "Running"。
-
-### 2. 创建编译容器
-
-在项目根目录打开终端：
+### 1.2 VM 内安装依赖
 
 ```bash
-cd /path/to/AIStatusHub.git
-
-# 启动 Ubuntu 容器，挂载当前项目目录
-docker run -it --name duo-builder \
-  -v "$(pwd):/workspace" \
-  -w /workspace \
-  ubuntu:22.04 bash
-```
-
-容器内先换国内源并安装依赖（以下命令在容器内执行）：
-
-```bash
-# 换阿里云源（可选，加速下载）
-sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
-apt-get update
-
-# 安装编译工具链
-apt-get install -y \
+sudo apt-get update
+sudo apt-get install -y \
   build-essential bison flex libssl-dev bc \
-  python3 python3-pip python3-venv \
+  python3 python3-pip \
   git wget curl unzip \
   libncurses5-dev libncursesw5-dev \
   device-tree-compiler \
   cpio rsync file texinfo \
   gawk chrpath diffstat \
-  zstd lz4
-
-# 退出容器时保持运行（Ctrl+P, Ctrl+Q）
-# 或者 exit 后重新进入：docker start -i duo-builder
+  zstd lz4 lzma \
+  cmake expect mtools genext2fs parted
 ```
 
-### 3. 下载 host-tools（交叉编译器）
+### 1.3 下载交叉编译器 (host-tools)
 
-在 **macOS 宿主机** 上执行（因为 Duo SDK 的 `host-tools` 需要预先下载）：
+在 **macOS 宿主机** 上执行（项目目录已被 Lima 挂载）：
 
 ```bash
 cd duo/CV1800B/duo-buildroot-sdk
 
-# 如果尚未下载 host-tools
+# 如未下载
 wget https://sophon-file.sophon.cn/sophon-prod-s3/drive/23/03/07/16/host-tools.tar.gz
 tar xzf host-tools.tar.gz
 ```
 
-> 如果仓库里已经有 `host-tools` 目录，跳过此步。
+---
+
+## 2. 关键：Lima VM 文件系统限制
+
+Lima 通过 **virtiofs/9p** 挂载 macOS 目录到 VM，**不支持 Linux 硬链接 (hard-link) 和 setuid 位**。这会导致 buildroot 的 `rsync` 和 `tar` 操作失败。
+
+**解决方案：** 将编译输出、rootfs 提取、genimage 临时目录全部重定向到 VM **本地 ext4 磁盘** (`/tmp/...`)，再用符号链接指向项目目录。
+
+以下 patch 已包含在仓库中，无需手动修改：
+
+| Patch 文件 | 作用 |
+|-----------|------|
+| `build/Makefile` (sd_image 目标) | rootfs 提取到 `/tmp/br-rootfs-local` |
+| `device/gen_burn_image_sd.sh` | genimage tmp 重定向到 `/tmp/genimage-tmp` |
+| `buildroot-2021.05/configs/milkv-duo-sd_musl_riscv64_defconfig` | 关闭 `BR2_PER_PACKAGE_DIRECTORIES` |
+
+> 如需手动创建符号链接：
+> ```bash
+> # buildroot output
+> rm -rf /tmp/duo-buildroot-output && mkdir -p /tmp/duo-buildroot-output
+> ln -sfn /tmp/duo-buildroot-output duo-buildroot-sdk/buildroot-2021.05/output
+>
+> # rootfs extract
+> rm -rf /tmp/br-rootfs-local && mkdir -p /tmp/br-rootfs-local
+> ```
 
 ---
 
-## 编译步骤
-
-以下命令全部在 **Docker 容器内** 执行。
-
-### 1. 进入 SDK 目录
+## 3. 全量编译
 
 ```bash
-cd /workspace/duo/CV1800B/duo-buildroot-sdk
-```
+# 进入项目目录（VM 内已挂载 macOS 目录）
+cd /Users/carlton/Documents/code/self/AIStatusHub.git/duo/CV1800B/duo-buildroot-sdk
 
-### 2. 加载环境变量
-
-```bash
+# 加载环境
 source build/envsetup_milkv.sh
-```
 
-### 3. 选择板级配置
-
-```bash
+# 选择板级配置
 defconfig cv1800b_milkv_duo_sd
-```
 
-输出应包含：
-```
-BR_DEFCONFIG=milkv-duo-sd_musl_riscv64_defconfig
-...
-Output path: /workspace/duo/CV1800B/duo-buildroot-sdk/install/soc_cv1800b_milkv_duo_sd
-```
-
-### 4. 开始全量编译
-
-```bash
+# 开始全量编译（首次 30-90 分钟）
 build_all
 ```
 
-首次编译时间较长（约 30–90 分钟，取决于机器性能和网络），会依次构建：
-- u-boot
-- linux kernel（含我们修改的 spidev.c）
-- osdrv
-- middleware（已移除 camera 相关）
-- buildroot rootfs
-- 打包 boot.sd / fip.bin / SD 卡镜像
+编译流程：
+1. u-boot
+2. linux kernel（含 spidev patch、GC9A01/ST7789V 驱动）
+3. osdrv / middleware
+4. buildroot rootfs
+5. 打包 boot.sd / fip.bin
 
-编译完成后输出文件在：
+输出路径：
 ```
-/workspace/duo/CV1800B/duo-buildroot-sdk/install/soc_cv1800b_milkv_duo_sd/
-```
-
-### 5. 生成 SD 卡烧录镜像
-
-```bash
-pack_sd_image
-```
-
-生成的最终镜像：
-```
-/workspace/duo/CV1800B/duo-buildroot-sdk/install/soc_cv1800b_milkv_duo_sd/milkv-duo-sd.img
+install/soc_cv1800b_milkv_duo_sd/
+├── fip.bin          # bootloader
+├── rawimages/
+│   └── boot.sd      # kernel + dtb + initramfs
+└── rootfs.tar.xz    # buildroot rootfs
 ```
 
 ---
 
-## 烧录步骤
+## 4. 手动打包 SD 镜像
 
-### 1. 取出 Duo 的 SD 卡，插入 Mac
-
-### 2. 找到 SD 卡设备名
+SDK 自带的 `genimage` 版本较旧，不支持 `hdimage` 的 `size` 参数，且 `genext2fs` 会 segfault。使用以下手动打包脚本：
 
 ```bash
+# 在 VM 内执行
+OUT=install/soc_cv1800b_milkv_duo_sd
+BOOT="$OUT/boot.vfat"
+ROOTFS="$OUT/rootfs.ext4"
+
+# 1. 创建 boot.vfat（128MB）
+rm -f "$BOOT"
+dd if=/dev/zero of="$BOOT" bs=1M count=128
+mkfs.vfat -F 32 -n boot "$BOOT"
+mcopy -i "$BOOT" "$OUT/fip.bin" ::/
+mcopy -i "$BOOT" "$OUT/rawimages/boot.sd" ::/
+
+# 2. 创建 rootfs.ext4（256MB）
+# rootfs 已从 buildroot 的 rootfs.tar.xz 提取到 /tmp/br-rootfs-local
+rm -f "$ROOTFS"
+dd if=/dev/zero of="$ROOTFS" bs=1M count=256
+mke2fs -t ext4 -d /tmp/br-rootfs-local "$ROOTFS"
+
+# 3. 组装 SD 卡镜像（400MB）
+IMG_TMP=/tmp/milkv-duo-sd.img
+rm -f "$IMG_TMP"
+dd if=/dev/zero of="$IMG_TMP" bs=1M count=400
+
+parted -s "$IMG_TMP" mklabel msdos
+parted -s "$IMG_TMP" mkpart primary fat32 1MiB 129MiB
+parted -s "$IMG_TMP" mkpart primary ext4 129MiB 385MiB
+parted -s "$IMG_TMP" set 1 boot on
+
+# 写入分区（offset 单位 512B 扇区）
+dd if="$BOOT"   of="$IMG_TMP" bs=512 seek=2048   conv=notrunc
+dd if="$ROOTFS" of="$IMG_TMP" bs=512 seek=263168 conv=notrunc
+
+mv -f "$IMG_TMP" "$OUT/milkv-duo-sd.img"
+```
+
+最终镜像：
+```
+install/soc_cv1800b_milkv_duo_sd/milkv-duo-sd.img
+```
+
+分区布局：
+| 分区 | 类型 | 大小 | 内容 |
+|------|------|------|------|
+| p1 | FAT32 (0x0C) | 128MB | fip.bin + boot.sd |
+| p2 | ext4 (0x83) | 256MB | buildroot rootfs |
+
+---
+
+## 5. 烧录到 SD 卡
+
+在 **macOS 宿主机** 上：
+
+```bash
+# 1. 找到 SD 卡设备（例如 /dev/disk4）
 diskutil list
-```
 
-找到类似 `/dev/disk4` 的设备（确认容量匹配，例如 16GB/32GB）。
-
-### 3. 卸载但不弹出
-
-```bash
+# 2. 卸载但不弹出
 diskutil unmountDisk /dev/disk4
-```
 
-### 4. 写入镜像
-
-```bash
-# 将 .img 路径替换为实际路径
-sudo dd if=/path/to/AIStatusHub.git/duo/CV1800B/duo-buildroot-sdk/install/soc_cv1800b_milkv_duo_sd/milkv-duo-sd.img \
+# 3. 写入镜像（用 rdisk 加速）
+sudo dd if=duo/CV1800B/duo-buildroot-sdk/install/soc_cv1800b_milkv_duo_sd/milkv-duo-sd.img \
   of=/dev/rdisk4 bs=1m status=progress
 
-# 写入完成后同步
+# 4. 同步并弹出
 sync
+diskutil eject /dev/disk4
 ```
-
-> 注意：使用 `/dev/rdisk4`（带 r 的裸设备）比 `/dev/disk4` 快很多。
-
-### 5. 弹出 SD 卡，插回 Duo，上电启动
 
 ---
 
-## 编译后验证
+## 6. 板上验证
 
-启动 Duo 后，SSH 登录并检查：
+插卡上电，SSH 登录：
 
 ```bash
-# 1. 确认 spidev bufsiz 已增大
+# 1. spidev 缓冲区
 cat /sys/module/spidev/parameters/bufsiz
-# 期望输出: 65536
+# → 65536
 
-# 2. 确认内存分配
+# 2. 内存总量
 cat /proc/meminfo | grep MemTotal
-# 期望约: 63MB (65024 kB 左右)
+# → ~65024 kB (63MB)
 
-# 3. 确认没有摄像头 ION/CMA
-dmesg | grep -i ion
-dmesg | grep -i cma
-# 期望无输出或显示 disabled
+# 3. 无 ION/CMA
+dmesg | grep -i ion    # 无输出
+dmesg | grep -i cma    # 无输出
 
-# 4. 运行 eye-anim 240×240 测帧率
-/root/eye-anim /root/eye_animation.bin 30 20000000
-# 期望 Actual FPS: 29+ 
+# 4. framebuffer 设备（接上 GC9A01 或 ST7789V）
+ls /dev/fb*
+# → /dev/fb0
+
+# 5. 屏幕初始化日志
+dmesg | grep -E "fbtft|gc9a01|st7789v"
 ```
 
 ---
 
-## 常见问题
+## 7. 内核 / 设备树增量编译
 
-### Q: Docker 编译时提示缺少 `makeinfo` / `texinfo`
-```bash
-apt-get install -y texinfo
-```
+如果仅修改了内核源码或设备树（如调整 GC9A01 引脚），无需全量编译：
 
-### Q: 编译中途断网，如何续编？
 ```bash
-# 重新进入容器
-docker start -i duo-builder
-cd /workspace/duo/CV1800B/duo-buildroot-sdk
+cd duo/CV1800B/duo-buildroot-sdk
 source build/envsetup_milkv.sh
 defconfig cv1800b_milkv_duo_sd
-build_all   # 会自动续编
+
+# 只编译 kernel + dtb + boot，不重新编译 buildroot
+build_kernel
 ```
 
-### Q: 只想修改 kernel 配置（如再加一个驱动）
-```bash
-source build/envsetup_milkv.sh
-defconfig cv1800b_milkv_duo_sd
-kernel_menuconfig   # 图形化配置
-build_all
-```
-
-### Q: 镜像太大，SD 卡写不下？
-`milkv-duo-sd.img` 默认约 400MB，官方 16GB/32GB SD 卡足够。如想精简 rootfs，可修改：
-```bash
-# 容器内
-vi /workspace/duo/CV1800B/duo-buildroot-sdk/buildroot-2021.05/configs/milkv-duo-sd_musl_riscv64_defconfig
-# 注释掉不需要的 BR2_PACKAGE_* 包，然后重新 build_all
-```
+然后重新执行第 4 节的打包步骤即可。
 
 ---
 
-## 附录：修改文件清单
+## 8. 已修改文件清单
 
 | 文件 | 修改内容 | 目的 |
 |------|---------|------|
 | `linux_5.10/drivers/spi/spidev.c` | `bufsiz = 65536` | 大帧 SPI 传输 |
+| `linux_5.10/drivers/staging/fbtft/fb_gc9a01.c` | **新增** GC9A01 驱动 | 240×240 圆屏支持 |
+| `linux_5.10/drivers/staging/fbtft/Makefile` | 添加 `fb_gc9a01.o` | 编译新驱动 |
+| `linux_5.10/drivers/staging/fbtft/Kconfig` | 添加 `FB_TFT_GC9A01` | 内核配置项 |
+| `linux_5.10/arch/riscv/boot/dts/cvitek/cv1800b_milkv_duo_sd.dts` | 添加 `gc9a01@0` + `st7789v@1` 节点 | 设备树绑定 |
+| `build/boards/cv180x/cv1800b_milkv_duo_sd/linux/cvitek_cv1800b_milkv_duo_sd_defconfig` | `FB_TFT_GC9A01=y`, `FB_TFT_ST7789V=y` | 启用驱动 |
 | `build/boards/cv180x/cv1800b_milkv_duo_sd/memmap.py` | `FREERTOS_SIZE = 1MB` | Linux 得 63MB |
-| `build/boards/cv180x/cv1800b_milkv_duo_sd/linux/cvitek_cv1800b_milkv_duo_sd_defconfig` | `# CONFIG_ION is not set`, `# CONFIG_CMA is not set` | 关闭摄像头内存 |
-| `device/milkv-duo-sd/overlay/` | 移除 camera/ISP 相关文件 | 清理无用文件 |
+| `build/Makefile` | rootfs 提取到 `/tmp/br-rootfs-local` | 绕过 virtiofs setuid 限制 |
+| `device/gen_burn_image_sd.sh` | genimage tmp 到 `/tmp/genimage-tmp` | 绕过 virtiofs 限制 |
+| `buildroot-2021.05/configs/..._defconfig` | 关闭 `BR2_PER_PACKAGE_DIRECTORIES` | 绕过硬链接限制 |
+| `linux_5.10/drivers/staging/android/ion/cvitek/Makefile` | 添加 `obj-$(CONFIG_ION)` 守卫 | 修复 ION 编译错误 |
+
+---
+
+## 9. 接线参考
+
+### GC9A01 (240×240 圆屏) — SPI2 CS0
+
+| 功能 | GP 引脚 |
+|------|---------|
+| CS | GP6 (硬件 CS0) |
+| SCK | GP7 |
+| MOSI | GP8 |
+| RST | GP10 |
+| DC | GP11 |
+| LED/BL | GP22 |
+
+### ST7789V (240×320 方屏) — SPI2 CS1 (GPIO)
+
+| 功能 | GP 引脚 |
+|------|---------|
+| CS | GP14 (GPIO CS) |
+| SCK | GP7 |
+| MOSI | GP8 |
+| RST | GP12 |
+| DC | GP13 |
+| LED/BL | GP22 |
+
+> 两个屏幕可独立使用，LED 背光共用 GP22。
