@@ -1,0 +1,300 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <linux/spi/spidev.h>
+
+#define GPIO_SYSFS_PATH "/sys/class/gpio"
+
+// Correct sysfs GPIO numbers for MilkV Duo (PWR_GPIO bank)
+#define PIN_DC   377
+#define PIN_RST  373
+#define PIN_CS   370
+
+#define SPI_DEV_PATH  "/dev/spidev0.0"
+#define DEFAULT_SPI_SPEED_HZ  20000000
+#define DEFAULT_FPS           30
+#define CHUNK_SIZE            4096
+
+static int gpio_export(int pin) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/gpio%d", GPIO_SYSFS_PATH, pin);
+    if (access(path, F_OK) == 0) return 0;
+    int fd = open(GPIO_SYSFS_PATH "/export", O_WRONLY);
+    if (fd < 0) { perror("export"); return -1; }
+    char buf[8]; int n = snprintf(buf, sizeof(buf), "%d", pin);
+    write(fd, buf, n); close(fd);
+    usleep(100000); return 0;
+}
+
+static int gpio_set_dir(int pin, const char *dir) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/gpio%d/direction", GPIO_SYSFS_PATH, pin);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    write(fd, dir, strlen(dir)); close(fd); return 0;
+}
+
+static int gpio_open(int pin) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/gpio%d/value", GPIO_SYSFS_PATH, pin);
+    return open(path, O_WRONLY);
+}
+
+static inline void gset(int fd, int v) {
+    lseek(fd, 0, SEEK_SET);
+    write(fd, v ? "1" : "0", 1);
+}
+
+static uint32_t g_spi_speed_hz = DEFAULT_SPI_SPEED_HZ;
+
+static int spi_xfer(int fd, const uint8_t *tx, size_t len) {
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)tx,
+        .rx_buf = 0,
+        .len = len,
+        .speed_hz = g_spi_speed_hz,
+        .delay_usecs = 0,
+        .bits_per_word = 8,
+    };
+    return ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
+}
+
+static void cmd(int spi, int dc, int cs, uint8_t c, const uint8_t *d, int len) {
+    gset(cs, 0);
+    gset(dc, 0);
+    spi_xfer(spi, &c, 1);
+    if (d && len > 0) {
+        gset(dc, 1);
+        spi_xfer(spi, d, len);
+    }
+    gset(cs, 1);
+}
+
+static void gc9a01_init(int spi, int dc, int rst, int cs) {
+    gset(dc, 1); gset(cs, 1); gset(rst, 1);
+    usleep(200000);
+    gset(rst, 0); usleep(200000);
+    gset(rst, 1); usleep(200000);
+
+    cmd(spi, dc, cs, 0xEF, NULL, 0);
+    cmd(spi, dc, cs, 0xEB, (uint8_t[]){0x14}, 1);
+    cmd(spi, dc, cs, 0xFE, NULL, 0);
+    cmd(spi, dc, cs, 0xEF, NULL, 0);
+    cmd(spi, dc, cs, 0xEB, (uint8_t[]){0x14}, 1);
+    cmd(spi, dc, cs, 0x84, (uint8_t[]){0x40}, 1);
+    cmd(spi, dc, cs, 0x85, (uint8_t[]){0xFF}, 1);
+    cmd(spi, dc, cs, 0x86, (uint8_t[]){0xFF}, 1);
+    cmd(spi, dc, cs, 0x87, (uint8_t[]){0xFF}, 1);
+    cmd(spi, dc, cs, 0x88, (uint8_t[]){0x0A}, 1);
+    cmd(spi, dc, cs, 0x89, (uint8_t[]){0x21}, 1);
+    cmd(spi, dc, cs, 0x8A, (uint8_t[]){0x00}, 1);
+    cmd(spi, dc, cs, 0x8B, (uint8_t[]){0x80}, 1);
+    cmd(spi, dc, cs, 0x8C, (uint8_t[]){0x01}, 1);
+    cmd(spi, dc, cs, 0x8D, (uint8_t[]){0x01}, 1);
+    cmd(spi, dc, cs, 0x8E, (uint8_t[]){0xFF}, 1);
+    cmd(spi, dc, cs, 0x8F, (uint8_t[]){0xFF}, 1);
+    cmd(spi, dc, cs, 0xB6, (uint8_t[]){0x00, 0x00}, 2);
+    cmd(spi, dc, cs, 0x3A, (uint8_t[]){0x05}, 1);
+    cmd(spi, dc, cs, 0x90, (uint8_t[]){0x08, 0x08, 0x08, 0x08}, 4);
+    cmd(spi, dc, cs, 0xBD, (uint8_t[]){0x06}, 1);
+    cmd(spi, dc, cs, 0xBC, (uint8_t[]){0x00}, 1);
+    cmd(spi, dc, cs, 0xFF, (uint8_t[]){0x60, 0x01, 0x04}, 3);
+    cmd(spi, dc, cs, 0xC3, (uint8_t[]){0x13}, 1);
+    cmd(spi, dc, cs, 0xC4, (uint8_t[]){0x13}, 1);
+    cmd(spi, dc, cs, 0xC9, (uint8_t[]){0x22}, 1);
+    cmd(spi, dc, cs, 0xBE, (uint8_t[]){0x11}, 1);
+    cmd(spi, dc, cs, 0xE1, (uint8_t[]){0x10, 0x0E}, 2);
+    cmd(spi, dc, cs, 0xDF, (uint8_t[]){0x21, 0x0c, 0x02}, 3);
+    cmd(spi, dc, cs, 0xF0, (uint8_t[]){0x45, 0x09, 0x08, 0x08, 0x26, 0x2A}, 6);
+    cmd(spi, dc, cs, 0xF1, (uint8_t[]){0x43, 0x70, 0x72, 0x36, 0x37, 0x6F}, 6);
+    cmd(spi, dc, cs, 0xF2, (uint8_t[]){0x45, 0x09, 0x08, 0x08, 0x26, 0x2A}, 6);
+    cmd(spi, dc, cs, 0xF3, (uint8_t[]){0x43, 0x70, 0x72, 0x36, 0x37, 0x6F}, 6);
+    cmd(spi, dc, cs, 0xED, (uint8_t[]){0x1B, 0x0B}, 2);
+    cmd(spi, dc, cs, 0xAE, (uint8_t[]){0x77}, 1);
+    cmd(spi, dc, cs, 0xCD, (uint8_t[]){0x63}, 1);
+    cmd(spi, dc, cs, 0x70, (uint8_t[]){0x07, 0x07, 0x04, 0x0E, 0x0F, 0x09, 0x07, 0x08, 0x03}, 9);
+    cmd(spi, dc, cs, 0xE8, (uint8_t[]){0x34}, 1);
+    cmd(spi, dc, cs, 0x62, (uint8_t[]){0x18, 0x0D, 0x71, 0xED, 0x70, 0x70, 0x18, 0x0F, 0x71, 0xEF, 0x70, 0x70}, 12);
+    cmd(spi, dc, cs, 0x63, (uint8_t[]){0x18, 0x11, 0x71, 0xF1, 0x70, 0x70, 0x18, 0x13, 0x71, 0xF3, 0x70, 0x70}, 12);
+    cmd(spi, dc, cs, 0x64, (uint8_t[]){0x28, 0x29, 0xF1, 0x01, 0xF1, 0x00, 0x07}, 7);
+    cmd(spi, dc, cs, 0x66, (uint8_t[]){0x3C, 0x00, 0xCD, 0x67, 0x45, 0x45, 0x10, 0x00, 0x00, 0x00}, 10);
+    cmd(spi, dc, cs, 0x67, (uint8_t[]){0x00, 0x3C, 0x00, 0x00, 0x00, 0x01, 0x54, 0x10, 0x32, 0x98}, 10);
+    cmd(spi, dc, cs, 0x74, (uint8_t[]){0x10, 0x85, 0x80, 0x00, 0x00, 0x4E, 0x00}, 7);
+    cmd(spi, dc, cs, 0x98, (uint8_t[]){0x3e, 0x07}, 2);
+    cmd(spi, dc, cs, 0x35, NULL, 0);
+    cmd(spi, dc, cs, 0x21, NULL, 0);
+    cmd(spi, dc, cs, 0x11, NULL, 0); usleep(120000);
+    cmd(spi, dc, cs, 0x29, NULL, 0); usleep(120000);
+}
+
+static void send_frame(int spi, int dc, int cs, const uint8_t *frame_data,
+                         uint16_t w, uint16_t h) {
+    // Center the eye on the 240x240 display
+    uint16_t x0 = (240 - w) / 2;
+    uint16_t y0 = (240 - h) / 2;
+    uint16_t x1 = x0 + w - 1;
+    uint16_t y1 = y0 + h - 1;
+
+    uint8_t col[4] = { (uint8_t)(x0 >> 8), (uint8_t)(x0 & 0xFF),
+                       (uint8_t)(x1 >> 8), (uint8_t)(x1 & 0xFF) };
+    uint8_t row[4] = { (uint8_t)(y0 >> 8), (uint8_t)(y0 & 0xFF),
+                       (uint8_t)(y1 >> 8), (uint8_t)(y1 & 0xFF) };
+    cmd(spi, dc, cs, 0x2A, col, 4);
+    cmd(spi, dc, cs, 0x2B, row, 4);
+    cmd(spi, dc, cs, 0x2C, NULL, 0);
+
+    gset(cs, 0);
+    gset(dc, 1);
+
+    size_t len = (size_t)w * h * 2;
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk = (len - offset) > CHUNK_SIZE ? CHUNK_SIZE : (len - offset);
+        spi_xfer(spi, frame_data + offset, chunk);
+        offset += chunk;
+    }
+
+    gset(cs, 1);
+}
+
+static ssize_t read_all(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = read(fd, (uint8_t *)buf + total, len - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+static long long now_us(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+static uint32_t parse_u32(const char *s) {
+    char *end;
+    unsigned long v = strtoul(s, &end, 10);
+    return (uint32_t)v;
+}
+
+int main(int argc, char **argv) {
+    const char *bin_path = (argc > 1) ? argv[1] : "/root/eye_animation.bin";
+    uint32_t target_fps = (argc > 2) ? parse_u32(argv[2]) : DEFAULT_FPS;
+    uint32_t spi_speed  = (argc > 3) ? parse_u32(argv[3]) : DEFAULT_SPI_SPEED_HZ;
+    if (target_fps == 0) target_fps = DEFAULT_FPS;
+    if (spi_speed == 0)  spi_speed  = DEFAULT_SPI_SPEED_HZ;
+
+    uint32_t frame_delay_us = 1000000U / target_fps;
+
+    setbuf(stdout, NULL);
+    printf("OpenEmo Animated Eye for MilkV Duo\n");
+    printf("Target FPS: %u, SPI speed: %u Hz, frame delay: %u us\n",
+           target_fps, spi_speed, frame_delay_us);
+
+    gpio_export(PIN_DC); gpio_export(PIN_RST); gpio_export(PIN_CS);
+    gpio_set_dir(PIN_DC, "out");
+    gpio_set_dir(PIN_RST, "out");
+    gpio_set_dir(PIN_CS, "out");
+
+    int dc = gpio_open(PIN_DC);
+    int rst = gpio_open(PIN_RST);
+    int cs = gpio_open(PIN_CS);
+    if (dc < 0 || rst < 0 || cs < 0) {
+        fprintf(stderr, "GPIO open failed\n"); return 1;
+    }
+
+    int spi = open(SPI_DEV_PATH, O_RDWR);
+    if (spi < 0) { perror("open spidev"); return 1; }
+
+    uint32_t mode = SPI_MODE_0;
+    uint8_t bits = 8;
+    if (ioctl(spi, SPI_IOC_WR_MODE, &mode) < 0) perror("SPI mode");
+    if (ioctl(spi, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) perror("SPI bits");
+    if (ioctl(spi, SPI_IOC_WR_MAX_SPEED_HZ, &spi_speed) < 0) perror("SPI speed");
+    g_spi_speed_hz = spi_speed;
+
+    printf("Initializing GC9A01...\n");
+    gc9a01_init(spi, dc, rst, cs);
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) { perror("open animation bin"); return 1; }
+
+    uint32_t frame_count, frame_size;
+    uint16_t width, height;
+    if (read_all(fd, &frame_count, 4) != 4 ||
+        read_all(fd, &frame_size, 4) != 4 ||
+        read_all(fd, &width, 2) != 2 ||
+        read_all(fd, &height, 2) != 2) {
+        fprintf(stderr, "Failed to read bin header\n"); return 1;
+    }
+
+    printf("Animation: %u frames, %ux%u, frame size=%u\n", frame_count, width, height, frame_size);
+
+    if (frame_size > 240*240*2) {
+        fprintf(stderr, "Invalid frame size\n"); return 1;
+    }
+
+    // Pre-load all frames into RAM
+    printf("Loading %u frames into RAM...\n", frame_count);
+    uint8_t *frames = malloc((size_t)frame_count * frame_size);
+    if (!frames) { fprintf(stderr, "malloc failed for frames\n"); return 1; }
+
+    long long t0 = now_us();
+    for (uint32_t i = 0; i < frame_count; i++) {
+        uint8_t *p = frames + (size_t)i * frame_size;
+        ssize_t n = read_all(fd, p, frame_size);
+        if (n != (ssize_t)frame_size) {
+            fprintf(stderr, "Frame %u: short read %zd/%u\n", i, n, frame_size);
+            free(frames); return 1;
+        }
+    }
+    long long t1 = now_us();
+    printf("Loaded in %.2f ms (%.1f kB total)\n",
+           (t1 - t0) / 1000.0,
+           (frame_count * frame_size) / 1024.0);
+    close(fd);
+
+    printf("Playing. Press Ctrl+C to stop.\n");
+
+    uint32_t frame = 0;
+    long long last_report = now_us();
+    uint32_t frames_since_report = 0;
+
+    while (1) {
+        long long frame_start = now_us();
+
+        send_frame(spi, dc, cs, frames + (size_t)frame * frame_size, width, height);
+        frame = (frame + 1) % frame_count;
+        frames_since_report++;
+
+        long long elapsed = now_us() - frame_start;
+        if (elapsed < (long long)frame_delay_us) {
+            usleep((useconds_t)(frame_delay_us - elapsed));
+        }
+
+        long long report_now = now_us();
+        if (report_now - last_report >= 2000000) { // every 2s
+            float actual_fps = frames_since_report * 1000000.0f / (report_now - last_report);
+            printf("Actual FPS: %.1f\n", actual_fps);
+            frames_since_report = 0;
+            last_report = report_now;
+        }
+    }
+
+    free(frames);
+    close(spi);
+    close(dc); close(rst); close(cs);
+    return 0;
+}

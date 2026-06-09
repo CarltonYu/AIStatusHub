@@ -17,8 +17,7 @@ The current wiring matches Duo SPI2 for the data pins:
 | RST | Pin 11 | GP8 | 373 | Reset GPIO |
 
 `test_hw_spi.c` uses `/dev/spidev0.0` for SPI2 clock/MOSI on the tested
-official image and controls
-DC/CS/RST through sysfs GPIO.
+official image and controls DC/CS/RST through sysfs GPIO.
 
 ## Important Pinmux Detail
 
@@ -46,8 +45,49 @@ On macOS, build with Zig:
 
 ```bash
 cd duo/CV1800B/c-gc9a01
-make test-hw-spi
+make test-hw-spi        # basic color test
+make eye-anim           # animated eye player
 ```
+
+## Animated Eye Player (`eye-anim`)
+
+Build + upload (default 240x240):
+
+```bash
+make scp-eye-anim       # uploads eye-anim + 240x240 bin
+```
+
+For smoother frame-rates, use a smaller animation:
+
+```bash
+make scp-eye-anim-160   # 160x160, ~30 FPS
+make scp-eye-anim-128   # 128x128, ~60 FPS
+```
+
+Run on Duo:
+
+```bash
+/root/eye-anim [bin_path] [target_fps] [spi_speed_hz]
+
+# examples
+/root/eye-anim /root/eye_animation.bin 30 20000000   # 30 FPS, 20 MHz SPI
+/root/eye-anim /root/eye_animation.bin 15 20000000   # 15 FPS, 20 MHz SPI
+```
+
+### Why frame-rate is limited
+
+The Duo kernel’s `spidev` has `bufsiz=4096`. A 240×240 RGB565 frame is 115200 bytes,
+so each frame must be split into 29 `ioctl` transfers. That overhead limits real FPS
+to about **15–16 FPS** even at 20 MHz SPI.
+
+| Resolution | Frame bytes | `ioctl` chunks | Actual FPS @ 20MHz | Quality |
+|------------|-------------|----------------|--------------------|---------|
+| 240×240 | 115200 | 29 | ~16 | Best |
+| 160×160 | 51200  | 13 | **~30** | Good |
+| 128×128 | 32768  | 8  | **~58** | Acceptable |
+
+If you rebuild the Buildroot/kernel later, add `spidev.bufsiz=65536` to the kernel
+command line; then 240×240 should also reach 30+ FPS in a single SPI transfer.
 
 ## Copy To Duo
 
