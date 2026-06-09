@@ -1,5 +1,5 @@
 [submodule "duo/CV1800B/duo-buildroot-sdk"]
 	path = duo/CV1800B/duo-buildroot-sdk
-	url = git@github.com:CarltonYu/duo-buildroot-sdk.git
+	url = https://github.com/CarltonYu/duo-buildroot-sdk.git
 	branch = develop
 	ignore = dirty
