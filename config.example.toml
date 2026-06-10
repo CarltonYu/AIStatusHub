@@ -25,11 +25,23 @@ remote_state_ttl_ms = 120000
 [proxy]
 enabled = false
 source = "hermes-agent"
+anthropic_source = "vscode-claude-code"
+kimi_source = "vscode-kimi-code"
 source_header = "x-aistatushub-source"
 upstream_base_url_header = "x-aistatushub-upstream-base-url"
 upstream_base_url = "https://api.example.com/v1"
+anthropic_upstream_base_url = "https://api.anthropic.com"
+kimi_upstream_base_url = "https://api.kimi.com/coding/v1"
 api_key = ""
 timeout_secs = 120
+
+[monitors.codex_local]
+enabled = false
+source = "codex-local"
+sessions_dir = ""
+poll_interval_ms = 1500
+idle_after_ms = 30000
+max_scan_files = 5000
 
 [[trusted_hubs]]
 hub_id = "hub_desktop_01"
@@ -43,6 +55,15 @@ type = "stdout"
 enabled = true
 format = "json"
 send_snapshot_on_start = false
+include_remote_states = false
+
+[[outputs]]
+id = "duo-face"
+type = "irisoled-udp"
+enabled = false
+url = "udp://192.168.42.1:25250"
+busy_expression = "angry"
+idle_expression = "normal"
 include_remote_states = false
 
 [[outputs]]

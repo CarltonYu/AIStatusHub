@@ -21,6 +21,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
     #[serde(default)]
+    pub monitors: MonitorsConfig,
+    #[serde(default)]
     pub trusted_hubs: Vec<TrustedHubConfig>,
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
@@ -136,6 +138,8 @@ pub struct OutputConfig {
     #[serde(default)]
     pub enabled: bool,
     pub url: Option<String>,
+    pub busy_expression: Option<String>,
+    pub idle_expression: Option<String>,
     pub target_hub_id: Option<String>,
     pub token: Option<String>,
     pub format: Option<String>,
@@ -165,6 +169,40 @@ pub struct ProxyConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_proxy_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MonitorsConfig {
+    #[serde(default)]
+    pub codex_local: CodexLocalMonitorConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexLocalMonitorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_codex_monitor_source")]
+    pub source: String,
+    pub sessions_dir: Option<PathBuf>,
+    #[serde(default = "default_codex_monitor_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_codex_monitor_idle_after_ms")]
+    pub idle_after_ms: u64,
+    #[serde(default = "default_codex_monitor_max_scan_files")]
+    pub max_scan_files: usize,
+}
+
+impl Default for CodexLocalMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: default_codex_monitor_source(),
+            sessions_dir: None,
+            poll_interval_ms: default_codex_monitor_poll_interval_ms(),
+            idle_after_ms: default_codex_monitor_idle_after_ms(),
+            max_scan_files: default_codex_monitor_max_scan_files(),
+        }
+    }
 }
 
 impl Default for ProxyConfig {
@@ -249,6 +287,7 @@ impl Default for AppConfig {
             privacy: PrivacyConfig::default(),
             state: StateConfig::default(),
             proxy: ProxyConfig::default(),
+            monitors: MonitorsConfig::default(),
             trusted_hubs: Vec::new(),
             outputs: Vec::new(),
             config_path: PathBuf::from("config.toml"),
@@ -328,4 +367,20 @@ fn default_proxy_upstream_base_url_header() -> String {
 
 fn default_proxy_timeout_secs() -> u64 {
     120
+}
+
+fn default_codex_monitor_source() -> String {
+    "codex-local".to_string()
+}
+
+fn default_codex_monitor_poll_interval_ms() -> u64 {
+    1500
+}
+
+fn default_codex_monitor_idle_after_ms() -> u64 {
+    30_000
+}
+
+fn default_codex_monitor_max_scan_files() -> usize {
+    5000
 }

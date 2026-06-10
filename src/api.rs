@@ -32,11 +32,16 @@ use crate::{
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub store: Arc<StateStore>,
+    pub outputs: Arc<outputs::OutputRuntime>,
 }
 
 impl AppState {
     pub fn new(config: Arc<AppConfig>, store: Arc<StateStore>) -> Self {
-        Self { config, store }
+        Self {
+            config,
+            store,
+            outputs: Arc::new(outputs::OutputRuntime::new()),
+        }
     }
 }
 
@@ -220,7 +225,7 @@ async fn ingest_event(
     state.store.add_activity(activity).await;
 
     if changed {
-        outputs::emit_state_upsert(&state.config, &task_state);
+        emit_state_changed(&state, &task_state).await;
         save_snapshot_best_effort(&state).await;
     }
 
@@ -1307,6 +1312,7 @@ async fn handle_hub_envelope(
             let changed = state.store.delete_state(&incoming.key).await;
             if changed {
                 outputs::emit_state_delete(&state.config, &incoming.key);
+                reconcile_device_outputs(&state).await;
                 save_snapshot_best_effort(&state).await;
             }
             Json(json!({ "changed": changed, "task_key": incoming.key })).into_response()
@@ -1344,7 +1350,10 @@ async fn handle_hub_envelope(
     }
 }
 
-async fn apply_internal_event(state: &AppState, payload: IngestEventRequest) -> (String, bool) {
+pub(crate) async fn apply_internal_event(
+    state: &AppState,
+    payload: IngestEventRequest,
+) -> (String, bool) {
     let event = normalize_event(payload, &state.config);
     let previous_key = crate::ingest::task_key(
         &event.provenance.origin_hub_id,
@@ -1367,7 +1376,7 @@ async fn apply_internal_event(state: &AppState, payload: IngestEventRequest) -> 
     state.store.add_activity(activity).await;
 
     if changed {
-        outputs::emit_state_upsert(&state.config, &task_state);
+        emit_state_changed(state, &task_state).await;
         save_snapshot_best_effort(state).await;
     }
 
@@ -1609,7 +1618,7 @@ async fn merge_one_remote_state(
     let changed = app.store.upsert_state(merged.clone()).await;
 
     if changed {
-        outputs::emit_state_upsert(&app.config, &merged);
+        emit_state_changed(app, &merged).await;
         app.store
             .add_activity(activity_from_state(
                 "remote.state.updated",
@@ -1620,6 +1629,16 @@ async fn merge_one_remote_state(
     }
 
     Ok(changed)
+}
+
+async fn emit_state_changed(app: &AppState, state: &crate::model::TaskState) {
+    outputs::emit_state_upsert(&app.config, state);
+    reconcile_device_outputs(app).await;
+}
+
+async fn reconcile_device_outputs(app: &AppState) {
+    let states = app.store.all_states().await;
+    outputs::reconcile_device_outputs(&app.config, &states, &app.outputs).await;
 }
 
 async fn save_snapshot_best_effort(state: &AppState) {

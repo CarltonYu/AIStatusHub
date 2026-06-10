@@ -1,6 +1,23 @@
-use serde_json::json;
+use std::{collections::HashMap, sync::Mutex};
 
-use crate::{config::AppConfig, model::TaskState};
+use serde_json::json;
+use tokio::net::UdpSocket;
+
+use crate::{
+    config::{AppConfig, OutputConfig},
+    model::{Locality, Status, TaskState},
+};
+
+#[derive(Debug, Default)]
+pub struct OutputRuntime {
+    device_modes: Mutex<HashMap<String, String>>,
+}
+
+impl OutputRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 pub fn emit_state_upsert(config: &AppConfig, state: &TaskState) {
     for output in config.outputs.iter().filter(|output| output.enabled) {
@@ -29,6 +46,52 @@ pub fn emit_state_delete(config: &AppConfig, key: &str) {
     }
 }
 
+pub async fn reconcile_device_outputs(
+    config: &AppConfig,
+    states: &[TaskState],
+    runtime: &OutputRuntime,
+) {
+    for output in config.outputs.iter().filter(|output| output.enabled) {
+        if !is_irisoled_udp_output(&output.output_type) {
+            continue;
+        }
+
+        let busy = states
+            .iter()
+            .filter(|state| output.include_remote_states || state.locality == Locality::Local)
+            .any(|state| is_busy_status(&state.status));
+        let desired_mode = if busy { "busy" } else { "idle" };
+
+        {
+            let modes = runtime.device_modes.lock().unwrap_or_else(|err| err.into_inner());
+            if modes
+                .get(&output.id)
+                .is_some_and(|previous| previous == desired_mode)
+            {
+                continue;
+            }
+        }
+
+        match send_irisoled_udp(output, desired_mode).await {
+            Ok(()) => {
+                runtime
+                    .device_modes
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .insert(output.id.clone(), desired_mode.to_string());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    output_id = %output.id,
+                    mode = desired_mode,
+                    %error,
+                    "failed to send IrisOLED UDP output"
+                );
+            }
+        }
+    }
+}
+
 fn print_state(output_id: &str, kind: &str, state: &TaskState) {
     println!(
         "{}",
@@ -49,4 +112,89 @@ fn print_state(output_id: &str, kind: &str, state: &TaskState) {
             "hub_path": state.hub_path,
         })
     );
+}
+
+fn is_irisoled_udp_output(output_type: &str) -> bool {
+    matches!(
+        output_type,
+        "irisoled-udp" | "iris-oled-udp" | "duo-irisoled" | "duo-face"
+    )
+}
+
+fn is_busy_status(status: &Status) -> bool {
+    matches!(
+        status,
+        Status::Starting
+            | Status::Thinking
+            | Status::Streaming
+            | Status::ToolRunning
+            | Status::WaitingApproval
+            | Status::Blocked
+            | Status::Compacting
+    )
+}
+
+async fn send_irisoled_udp(output: &OutputConfig, mode: &str) -> std::io::Result<()> {
+    let Some(target) = irisoled_target(output) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing irisoled UDP url",
+        ));
+    };
+    let command = irisoled_command(output, mode);
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.send_to(command.as_bytes(), target.as_str()).await?;
+
+    tracing::info!(
+        output_id = %output.id,
+        target = %target,
+        mode,
+        command = %command,
+        "sent IrisOLED UDP output"
+    );
+
+    Ok(())
+}
+
+fn irisoled_target(output: &OutputConfig) -> Option<String> {
+    output
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| url.strip_prefix("udp://").unwrap_or(url))
+        .map(|target| target.trim_end_matches('/').to_string())
+}
+
+fn irisoled_command(output: &OutputConfig, mode: &str) -> String {
+    match mode {
+        "busy" => {
+            let expression =
+                expression_name(output.busy_expression.as_deref(), "angry");
+            format!("default {expression}")
+        }
+        _ => {
+            let expression =
+                expression_name(output.idle_expression.as_deref(), "normal");
+            if expression == "normal" {
+                "normal".to_string()
+            } else {
+                format!("default {expression}")
+            }
+        }
+    }
+}
+
+fn expression_name(value: Option<&str>, default: &str) -> String {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    let value = value.unwrap_or(default);
+
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        value.to_string()
+    } else {
+        default.to_string()
+    }
 }

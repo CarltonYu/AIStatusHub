@@ -117,6 +117,10 @@ impl StateStore {
         states
     }
 
+    pub async fn all_states(&self) -> Vec<TaskState> {
+        self.inner.read().await.states.values().cloned().collect()
+    }
+
     pub async fn add_activity(&self, item: ActivityItem) {
         {
             let mut inner = self.inner.write().await;

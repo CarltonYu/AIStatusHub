@@ -174,6 +174,15 @@ enabled = true
 format = "json"
 
 [[outputs]]
+id = "duo-face"
+type = "irisoled-udp"
+enabled = false
+url = "udp://192.168.42.1:25250"
+busy_expression = "angry"
+idle_expression = "normal"
+include_remote_states = false
+
+[[outputs]]
 id = "home-server"
 type = "hub-forward"
 enabled = false

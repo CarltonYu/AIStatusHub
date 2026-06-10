@@ -4,6 +4,7 @@ mod config;
 mod hub;
 mod ingest;
 mod model;
+mod monitors;
 mod outputs;
 mod security;
 mod snapshot;
@@ -17,7 +18,14 @@ use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("Error: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     if cli::is_report_command() {
         cli::run_report_command().await?;
         return Ok(());
@@ -41,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app_state = api::AppState::new(Arc::new(config), store);
+    monitors::spawn(app_state.clone());
     let app = api::router(app_state.clone());
     let addr: SocketAddr = format!(
         "{}:{}",
@@ -48,7 +57,14 @@ async fn main() -> anyhow::Result<()> {
     )
     .parse()
     .context("invalid server host/port")?;
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr).await.with_context(|| {
+        format!("failed to bind AIStatusHub on {addr}; another instance may already be running")
+    })?;
+
+    {
+        let states = app_state.store.all_states().await;
+        outputs::reconcile_device_outputs(&app_state.config, &states, &app_state.outputs).await;
+    }
 
     tracing::info!(
         hub_id = %app_state.config.hub.hub_id,
