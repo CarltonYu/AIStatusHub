@@ -51,34 +51,46 @@ make eye-anim           # animated eye player
 
 ## Animated Eye Player (`eye-anim`)
 
-Build + upload (default 240x240):
+Build + upload (default 200x200 eye, 240 smooth frames, black border):
 
 ```bash
 make scp-eye-anim       # uploads eye-anim + 240x240 bin
 ```
 
+The upload target generates this file if it is missing:
+
+```text
+../eyes-resources/parsed/eye_animation_200x200_smooth_240f.bin
+```
+
 For smoother frame-rates, use a smaller animation:
 
 ```bash
-make scp-eye-anim-160   # 160x160, ~30 FPS
+make scp-eye-anim-240   # 240x240, best detail
+make scp-eye-anim-160   # 160x160, faster
 make scp-eye-anim-128   # 128x128, ~60 FPS
 ```
 
 Run on Duo:
 
 ```bash
-/root/eye-anim [bin_path] [target_fps] [spi_speed_hz]
+/root/eye-anim [bin_path] [target_fps, 0=uncapped] [spi_speed_hz] [auto|preload|stream]
 
 # examples
-/root/eye-anim /root/eye_animation.bin 30 20000000   # 30 FPS, 20 MHz SPI
-/root/eye-anim /root/eye_animation.bin 15 20000000   # 15 FPS, 20 MHz SPI
+/root/eye-anim /root/eye_animation.bin 60 20000000 auto
+/root/eye-anim /root/eye_animation.bin 0  20000000 stream   # no sleep; SPI-limited
 ```
+
+`eye-anim` now sets the required `duo-pinmux` modes automatically, matching the
+pin binding above. In `auto` mode it preloads small animation files into RAM and
+streams larger 240-frame files from storage to avoid memory pressure on Duo.
 
 ### Why frame-rate is limited
 
 The Duo kernel’s `spidev` has `bufsiz=4096`. A 240×240 RGB565 frame is 115200 bytes,
 so each frame must be split into 29 `ioctl` transfers. That overhead limits real FPS
-to about **15–16 FPS** even at 20 MHz SPI.
+to about **15–16 FPS** even at 20 MHz SPI. The 240-frame animation gives smoother
+motion, but the visible refresh rate is still capped by SPI transfer throughput.
 
 | Resolution | Frame bytes | `ioctl` chunks | Actual FPS @ 20MHz | Quality |
 |------------|-------------|----------------|--------------------|---------|
@@ -88,6 +100,13 @@ to about **15–16 FPS** even at 20 MHz SPI.
 
 If you rebuild the Buildroot/kernel later, add `spidev.bufsiz=65536` to the kernel
 command line; then 240×240 should also reach 30+ FPS in a single SPI transfer.
+
+To regenerate a different frame count:
+
+```bash
+cd duo/CV1800B/eyes-resources
+.venv/bin/python generate_smooth_animation_bin.py 200 360
+```
 
 ## Copy To Duo
 

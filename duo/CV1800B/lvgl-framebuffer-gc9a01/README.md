@@ -93,6 +93,61 @@ scp -O build/fb-fill root@192.168.42.1:/root/
 ssh root@192.168.42.1 '/root/fb-fill'
 ```
 
+## 200x200 Eye Animation On Framebuffer
+
+The `fb-eye` player uses the same RGB565 animation package as the direct SPI
+player, but writes to `/dev/fb0`. Use this after booting a patched image that
+exposes the SPI LCD as a Linux framebuffer:
+
+```bash
+cd duo/CV1800B/eyes-resources
+.venv/bin/python generate_smooth_animation_bin.py 200 240
+
+cd ../lvgl-framebuffer-gc9a01/fb-eye
+make
+sshpass -p milkv scp -O fb-eye-anim root@192.168.42.1:/root/
+sshpass -p milkv scp -O ../../eyes-resources/parsed/eye_animation_200x200_smooth_240f.bin root@192.168.42.1:/root/eye_animation.bin
+sshpass -p milkv ssh root@192.168.42.1 '/root/fb-eye-anim /root/eye_animation.bin /dev/fb0 60'
+```
+
+For a maximum-throughput test, pass `0` as the FPS value:
+
+```bash
+/root/fb-eye-anim /root/eye_animation.bin /dev/fb0 0
+```
+
+## IrisOLED Robot Expressions
+
+For robot-style expression states, use `irisoled-face`. It vendors the
+MIT-licensed `orji123/Irisoled` bitmap set, runs as a daemon, and accepts
+runtime commands through a UNIX socket or UDP port `25250`:
+
+```bash
+cd duo/CV1800B/lvgl-framebuffer-gc9a01/irisoled-face
+make
+make scp
+sshpass -p milkv ssh root@192.168.42.1 'sh /root/install-init.sh'
+```
+
+Examples on Duo:
+
+```bash
+irisoled-face play happy --repeat 3
+irisoled-face play angry --duration 5s
+irisoled-face play busy --duration 10s
+irisoled-face normal
+```
+
+Examples from an upper host on the USB network:
+
+```powershell
+powershell -NoProfile -Command "$u=New-Object Net.Sockets.UdpClient; $b=[Text.Encoding]::ASCII.GetBytes('default sad'); [void]$u.Send($b,$b.Length,'192.168.42.1',25250); $u.Close()"
+powershell -NoProfile -Command "$u=New-Object Net.Sockets.UdpClient; $b=[Text.Encoding]::ASCII.GetBytes('play happy --repeat 3'); [void]$u.Send($b,$b.Length,'192.168.42.1',25250); $u.Close()"
+```
+
+See `irisoled-face/README.md` for the supported IrisOLED names and state
+machine behavior.
+
 On the currently tested official image, `/dev/fb0` does not exist yet. A
 runtime attempt to bind the built-in `fb_st7789v` driver to the existing SPI2
 `spidev` device failed with:

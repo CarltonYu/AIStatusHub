@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <linux/spi/spidev.h>
 
 #define GPIO_SYSFS_PATH "/sys/class/gpio"
@@ -18,8 +19,37 @@
 
 #define SPI_DEV_PATH  "/dev/spidev0.0"
 #define DEFAULT_SPI_SPEED_HZ  20000000
-#define DEFAULT_FPS           30
-#define CHUNK_SIZE            4096
+#define DEFAULT_FPS           60
+#define DEFAULT_CHUNK_SIZE    4096
+#define PRELOAD_LIMIT_BYTES   (12U * 1024U * 1024U)
+
+static uint32_t g_spi_speed_hz = DEFAULT_SPI_SPEED_HZ;
+static size_t g_chunk_size = DEFAULT_CHUNK_SIZE;
+
+static void run_pinmux(const char *cmdline) {
+    int rc = system(cmdline);
+    if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+        fprintf(stderr, "warning: pinmux command failed: %s\n", cmdline);
+    }
+}
+
+static void configure_pinmux(void) {
+    run_pinmux("duo-pinmux -w GP3/GP3 >/dev/null 2>&1");
+    run_pinmux("duo-pinmux -w GP6/SPI2_SCK >/dev/null 2>&1");
+    run_pinmux("duo-pinmux -w GP7/SPI2_SDO >/dev/null 2>&1");
+    run_pinmux("duo-pinmux -w GP8/GP8 >/dev/null 2>&1");
+    run_pinmux("duo-pinmux -w GP9/GP9 >/dev/null 2>&1");
+}
+
+static size_t detect_spidev_bufsiz(void) {
+    FILE *f = fopen("/sys/module/spidev/parameters/bufsiz", "r");
+    unsigned long v = DEFAULT_CHUNK_SIZE;
+
+    if (!f) return DEFAULT_CHUNK_SIZE;
+    if (fscanf(f, "%lu", &v) != 1 || v < 256) v = DEFAULT_CHUNK_SIZE;
+    fclose(f);
+    return (size_t)v;
+}
 
 static int gpio_export(int pin) {
     char path[128];
@@ -51,8 +81,6 @@ static inline void gset(int fd, int v) {
     write(fd, v ? "1" : "0", 1);
 }
 
-static uint32_t g_spi_speed_hz = DEFAULT_SPI_SPEED_HZ;
-
 static int spi_xfer(int fd, const uint8_t *tx, size_t len) {
     struct spi_ioc_transfer tr = {
         .tx_buf = (unsigned long)tx,
@@ -62,7 +90,11 @@ static int spi_xfer(int fd, const uint8_t *tx, size_t len) {
         .delay_usecs = 0,
         .bits_per_word = 8,
     };
-    return ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
+    if (ioctl(fd, SPI_IOC_MESSAGE(1), &tr) < 1) {
+        perror("SPI_IOC_MESSAGE");
+        return -1;
+    }
+    return 0;
 }
 
 static void cmd(int spi, int dc, int cs, uint8_t c, const uint8_t *d, int len) {
@@ -133,8 +165,8 @@ static void gc9a01_init(int spi, int dc, int rst, int cs) {
     cmd(spi, dc, cs, 0x29, NULL, 0); usleep(120000);
 }
 
-static void send_frame(int spi, int dc, int cs, const uint8_t *frame_data,
-                         uint16_t w, uint16_t h) {
+static int send_frame(int spi, int dc, int cs, const uint8_t *frame_data,
+                      uint16_t w, uint16_t h) {
     // Center the eye on the 240x240 display
     uint16_t x0 = (240 - w) / 2;
     uint16_t y0 = (240 - h) / 2;
@@ -155,12 +187,41 @@ static void send_frame(int spi, int dc, int cs, const uint8_t *frame_data,
     size_t len = (size_t)w * h * 2;
     size_t offset = 0;
     while (offset < len) {
-        size_t chunk = (len - offset) > CHUNK_SIZE ? CHUNK_SIZE : (len - offset);
-        spi_xfer(spi, frame_data + offset, chunk);
+        size_t chunk = (len - offset) > g_chunk_size ? g_chunk_size : (len - offset);
+        if (spi_xfer(spi, frame_data + offset, chunk) < 0) {
+            gset(cs, 1);
+            return -1;
+        }
         offset += chunk;
     }
 
     gset(cs, 1);
+    return 0;
+}
+
+static int clear_screen_black(int spi, int dc, int cs) {
+    static uint8_t zeros[DEFAULT_CHUNK_SIZE];
+    uint8_t col[4] = {0x00, 0x00, 0x00, 239};
+    uint8_t row[4] = {0x00, 0x00, 0x00, 239};
+    size_t len = 240U * 240U * 2U;
+    size_t offset = 0;
+
+    cmd(spi, dc, cs, 0x2A, col, 4);
+    cmd(spi, dc, cs, 0x2B, row, 4);
+    cmd(spi, dc, cs, 0x2C, NULL, 0);
+
+    gset(cs, 0);
+    gset(dc, 1);
+    while (offset < len) {
+        size_t chunk = (len - offset) > sizeof(zeros) ? sizeof(zeros) : (len - offset);
+        if (spi_xfer(spi, zeros, chunk) < 0) {
+            gset(cs, 1);
+            return -1;
+        }
+        offset += chunk;
+    }
+    gset(cs, 1);
+    return 0;
 }
 
 static ssize_t read_all(int fd, void *buf, size_t len) {
@@ -183,6 +244,12 @@ static long long now_us(void) {
     return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
 }
 
+static void wait_until_us(long long deadline) {
+    while (now_us() < deadline) {
+        ;
+    }
+}
+
 static uint32_t parse_u32(const char *s) {
     char *end;
     unsigned long v = strtoul(s, &end, 10);
@@ -193,16 +260,23 @@ int main(int argc, char **argv) {
     const char *bin_path = (argc > 1) ? argv[1] : "/root/eye_animation.bin";
     uint32_t target_fps = (argc > 2) ? parse_u32(argv[2]) : DEFAULT_FPS;
     uint32_t spi_speed  = (argc > 3) ? parse_u32(argv[3]) : DEFAULT_SPI_SPEED_HZ;
-    if (target_fps == 0) target_fps = DEFAULT_FPS;
+    const char *load_mode = (argc > 4) ? argv[4] : "auto";
     if (spi_speed == 0)  spi_speed  = DEFAULT_SPI_SPEED_HZ;
 
-    uint32_t frame_delay_us = 1000000U / target_fps;
+    uint32_t frame_delay_us = target_fps ? (1000000U / target_fps) : 0;
 
     setbuf(stdout, NULL);
     printf("OpenEmo Animated Eye for MilkV Duo\n");
-    printf("Target FPS: %u, SPI speed: %u Hz, frame delay: %u us\n",
-           target_fps, spi_speed, frame_delay_us);
+    if (target_fps) {
+        printf("Target FPS: %u, SPI speed: %u Hz, frame delay: %u us\n",
+               target_fps, spi_speed, frame_delay_us);
+    } else {
+        printf("Target FPS: uncapped, SPI speed: %u Hz\n", spi_speed);
+    }
+    printf("Usage: %s [bin_path] [target_fps, 0=uncapped] [spi_speed_hz] [auto|preload|stream]\n",
+           argv[0]);
 
+    configure_pinmux();
     gpio_export(PIN_DC); gpio_export(PIN_RST); gpio_export(PIN_CS);
     gpio_set_dir(PIN_DC, "out");
     gpio_set_dir(PIN_RST, "out");
@@ -224,6 +298,9 @@ int main(int argc, char **argv) {
     if (ioctl(spi, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) perror("SPI bits");
     if (ioctl(spi, SPI_IOC_WR_MAX_SPEED_HZ, &spi_speed) < 0) perror("SPI speed");
     g_spi_speed_hz = spi_speed;
+    g_chunk_size = detect_spidev_bufsiz();
+    if (g_chunk_size > 65536) g_chunk_size = 65536;
+    printf("SPI transfer chunk: %zu bytes\n", g_chunk_size);
 
     printf("Initializing GC9A01...\n");
     gc9a01_init(spi, dc, rst, cs);
@@ -242,46 +319,88 @@ int main(int argc, char **argv) {
 
     printf("Animation: %u frames, %ux%u, frame size=%u\n", frame_count, width, height, frame_size);
 
-    if (frame_size > 240*240*2) {
+    if (width > 240 || height > 240 || frame_size != (uint32_t)width * height * 2) {
         fprintf(stderr, "Invalid frame size\n"); return 1;
     }
 
-    // Pre-load all frames into RAM
-    printf("Loading %u frames into RAM...\n", frame_count);
-    uint8_t *frames = malloc((size_t)frame_count * frame_size);
-    if (!frames) { fprintf(stderr, "malloc failed for frames\n"); return 1; }
-
-    long long t0 = now_us();
-    for (uint32_t i = 0; i < frame_count; i++) {
-        uint8_t *p = frames + (size_t)i * frame_size;
-        ssize_t n = read_all(fd, p, frame_size);
-        if (n != (ssize_t)frame_size) {
-            fprintf(stderr, "Frame %u: short read %zd/%u\n", i, n, frame_size);
-            free(frames); return 1;
-        }
+    if ((width < 240 || height < 240) && clear_screen_black(spi, dc, cs) < 0) {
+        return 1;
     }
-    long long t1 = now_us();
-    printf("Loaded in %.2f ms (%.1f kB total)\n",
-           (t1 - t0) / 1000.0,
-           (frame_count * frame_size) / 1024.0);
-    close(fd);
+
+    size_t total_bytes = (size_t)frame_count * frame_size;
+    int force_preload = strcmp(load_mode, "preload") == 0;
+    int force_stream = strcmp(load_mode, "stream") == 0;
+    int use_preload = force_preload || (!force_stream && total_bytes <= PRELOAD_LIMIT_BYTES);
+    if (!force_preload && !force_stream && strcmp(load_mode, "auto") != 0) {
+        fprintf(stderr, "unknown load mode: %s\n", load_mode);
+        return 1;
+    }
+
+    uint8_t *frames = NULL;
+    uint8_t *stream_frame = NULL;
+    if (use_preload) {
+        printf("Loading %u frames into RAM (%.1f MiB)...\n",
+               frame_count, total_bytes / 1048576.0);
+        frames = malloc(total_bytes);
+        if (!frames) { fprintf(stderr, "malloc failed for frames\n"); return 1; }
+
+        long long t0 = now_us();
+        for (uint32_t i = 0; i < frame_count; i++) {
+            uint8_t *p = frames + (size_t)i * frame_size;
+            ssize_t n = read_all(fd, p, frame_size);
+            if (n != (ssize_t)frame_size) {
+                fprintf(stderr, "Frame %u: short read %zd/%u\n", i, n, frame_size);
+                free(frames); return 1;
+            }
+        }
+        long long t1 = now_us();
+        printf("Loaded in %.2f ms\n", (t1 - t0) / 1000.0);
+        close(fd);
+        fd = -1;
+    } else {
+        printf("Streaming frames from file (%.1f MiB animation, low RAM mode)\n",
+               total_bytes / 1048576.0);
+        stream_frame = malloc(frame_size);
+        if (!stream_frame) { fprintf(stderr, "malloc failed for stream frame\n"); return 1; }
+    }
 
     printf("Playing. Press Ctrl+C to stop.\n");
 
     uint32_t frame = 0;
     long long last_report = now_us();
+    long long next_frame_at = last_report;
     uint32_t frames_since_report = 0;
 
     while (1) {
-        long long frame_start = now_us();
+        const uint8_t *frame_data;
 
-        send_frame(spi, dc, cs, frames + (size_t)frame * frame_size, width, height);
+        if (use_preload) {
+            frame_data = frames + (size_t)frame * frame_size;
+        } else {
+            if (frame == 0 && lseek(fd, 12, SEEK_SET) < 0) {
+                perror("rewind animation");
+                break;
+            }
+            ssize_t n = read_all(fd, stream_frame, frame_size);
+            if (n != (ssize_t)frame_size) {
+                fprintf(stderr, "Frame %u: short read %zd/%u\n", frame, n, frame_size);
+                break;
+            }
+            frame_data = stream_frame;
+        }
+
+        if (send_frame(spi, dc, cs, frame_data, width, height) < 0) {
+            break;
+        }
         frame = (frame + 1) % frame_count;
         frames_since_report++;
 
-        long long elapsed = now_us() - frame_start;
-        if (elapsed < (long long)frame_delay_us) {
-            usleep((useconds_t)(frame_delay_us - elapsed));
+        if (frame_delay_us) {
+            next_frame_at += frame_delay_us;
+            if (now_us() > next_frame_at + (long long)frame_delay_us) {
+                next_frame_at = now_us();
+            }
+            wait_until_us(next_frame_at);
         }
 
         long long report_now = now_us();
@@ -294,6 +413,8 @@ int main(int argc, char **argv) {
     }
 
     free(frames);
+    free(stream_frame);
+    if (fd >= 0) close(fd);
     close(spi);
     close(dc); close(rst); close(cs);
     return 0;

@@ -323,6 +323,80 @@ fb_st7789v: probe of spi0.0 failed with error -22
 
 结论：当前官方镜像只能运行用户态 SPI2 直驱测试；严格的 Linux framebuffer/LVGL 路线必须启动带补丁的 SDK 镜像。当前电脑是 macOS，SDK 自带 toolchain 是 Linux x86_64 ELF，且本机无 Docker/Podman，因此无法在这台机器上完成官方整镜像构建。
 
+### 7.4 2026-06-10：fork SDK 原生 framebuffer 源码落地
+
+主仓库已拉新，`duo/CV1800B/duo-buildroot-sdk` submodule 的 remote 已同步到自己的 fork：
+
+```text
+https://github.com/CarltonYu/duo-buildroot-sdk.git
+```
+
+本次不再只保留外部 patch，而是把当前接线对应的原生 framebuffer 改动直接落到 SDK 源码中：
+
+- `u-boot/cvi_board_init.c`
+  - GP3/Pin5：启动 pinmux 改成 `PWR_GPIO_25`，用作 LCD DC。
+  - GP8/Pin11：启动 pinmux 改成 `PWR_GPIO_21`，用作 LCD RST。
+  - GP6/GP7/GP9：保持 `SPI2_SCK`、`SPI2_SDO`、`SPI2_CS_X`。
+- `dts_riscv/cv1800b_milkv_duo_sd.dts`
+  - `&spi2` 删除 `spidev@0`。
+  - 默认启用 `galaxycore,gc9a01` 的 `display@0`，生成 `/dev/fb0`。
+  - 保留 ST7789/ST7789V 的同线切换模板，但默认不同时启用，避免两个屏幕抢同一个 CS。
+- `linux_5.10/drivers/staging/fbtft/fb_gc9a01.c`
+  - 新增/修正 GC9A01 fbtft 驱动。
+  - 初始化序列对齐已跑通的 `/dev/spidev0.0` 硬件 SPI 测试。
+  - 默认不强制 BGR，颜色反了再在 DTS 节点加 `bgr;`。
+- Kernel defconfig / Kconfig / Makefile
+  - `CONFIG_FB_TFT_ST7789V=y`
+  - `CONFIG_FB_TFT_GC9A01=y`
+
+详细复盘文件：
+
+```text
+duo/CV1800B/NATIVE_FRAMEBUFFER_SPI_LCD.md
+```
+
+### 7.5 2026-06-10：重新编译并生成 SD 镜像
+
+问题现象：昨天打包出的镜像上电后 Duo 只有红色电源灯亮，蓝色 LED 不亮/不闪。
+
+本次检查到一个明确的 SD 镜像打包风险点：
+
+- `device/milkv-duo-sd/genimage.cfg` 里仍引用 `image = "rootfs.ext4"`。
+- 但 `image rootfs.ext4 { ... }` 定义曾被删掉。
+- 这会导致 `pack_sd_image` 阶段不能可靠地从当前 rootfs 生成第二分区，属于比 framebuffer 驱动更靠前的启动链路问题。
+
+已恢复官方 `rootfs.ext4` 定义，并在 Lima `duo-builder` VM 中执行：
+
+```bash
+source build/envsetup_milkv.sh
+defconfig cv1800b_milkv_duo_sd
+build_all
+pack_sd_image
+```
+
+构建结果：
+
+```text
+install/soc_cv1800b_milkv_duo_sd/milkv-duo-sd.img
+install/soc_cv1800b_milkv_duo_sd/upgrade.zip
+```
+
+新 SD 镜像信息：
+
+```text
+milkv-duo-sd.img: 896 MiB
+SHA256: 5fac87a3cd473b51c4f42ef8761d0b1d558016526221ca1a03e5fe2052169f74
+
+Partition 1: 128 MiB FAT32 boot, contains fip.bin and boot.sd
+Partition 2: 768 MiB Linux rootfs, fsck clean
+```
+
+额外确认：
+
+- `boot.vfat` 内包含新的 `fip.bin` 和 `rawimages/boot.sd`。
+- kernel `.config` 包含 `CONFIG_FB_TFT=y`、`CONFIG_FB_TFT_ST7789V=y`、`CONFIG_FB_TFT_GC9A01=y`。
+- 反解 `cv1800b_milkv_duo_sd.dtb`，SPI2 下为 `display@0 compatible = "galaxycore,gc9a01"`，已删除 SPI2 的 `spidev@0`。
+
 ---
 
 ## 八、故障排查清单

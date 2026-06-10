@@ -3,12 +3,14 @@
 
 CC = zig cc
 CFLAGS = -target riscv64-linux-musl -O2 -Wall -Wextra -static
+PYTHON ?= ../eyes-resources/.venv/bin/python
 TARGET = gc9a01-demo
 HW_SPI_TARGET = test-hw-spi
 EYE_ANIM_TARGET = eye-anim
 
-EYE_RES ?= 240
-EYE_ANIM_BIN = ../eyes-resources/parsed/eye_animation_$(EYE_RES)x$(EYE_RES).bin
+EYE_RES ?= 200
+EYE_FRAMES ?= 240
+EYE_ANIM_BIN ?= ../eyes-resources/parsed/eye_animation_$(EYE_RES)x$(EYE_RES)_smooth_$(EYE_FRAMES)f.bin
 
 OBJS = main.o gc9a01.o
 
@@ -29,6 +31,9 @@ test-hw-spi: test_hw_spi.c
 $(EYE_ANIM_TARGET): eye_anim.c
 	$(CC) $(CFLAGS) -o $(EYE_ANIM_TARGET) eye_anim.c
 
+$(EYE_ANIM_BIN):
+	cd ../eyes-resources && $(PYTHON) generate_smooth_animation_bin.py $(EYE_RES) $(EYE_FRAMES)
+
 # Transfer to Duo (use -O for Dropbear compatibility)
 scp: $(TARGET)
 	scp -O $(TARGET) root@192.168.42.1:/root/
@@ -36,7 +41,7 @@ scp: $(TARGET)
 scp-hw-spi: test-hw-spi
 	scp -O $(HW_SPI_TARGET) root@192.168.42.1:/root/
 
-scp-eye-anim: $(EYE_ANIM_TARGET)
+scp-eye-anim: $(EYE_ANIM_TARGET) $(EYE_ANIM_BIN)
 	sshpass -p milkv scp -O $(EYE_ANIM_TARGET) root@192.168.42.1:/root/
 	sshpass -p milkv scp -O $(EYE_ANIM_BIN) root@192.168.42.1:/root/eye_animation.bin
 
