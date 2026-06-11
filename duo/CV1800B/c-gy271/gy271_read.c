@@ -13,15 +13,57 @@
 #ifndef I2C_SLAVE
 #define I2C_SLAVE 0x0703
 #endif
+#ifndef I2C_SMBUS
+#define I2C_SMBUS 0x0720
+#endif
+#ifndef I2C_SMBUS_WRITE
+#define I2C_SMBUS_WRITE 0
+#endif
+#ifndef I2C_SMBUS_QUICK
+#define I2C_SMBUS_QUICK 0
+#endif
+#ifndef I2C_RDWR
+#define I2C_RDWR 0x0707
+#endif
+#ifndef I2C_M_RD
+#define I2C_M_RD 0x0001
+#endif
 
 #define DEFAULT_I2C_DEV "/dev/i2c-1"
 #define QMC5883L_ADDR 0x0d
+#define QMC5883P_ADDR 0x2c
 #define HMC5883L_ADDR 0x1e
 #define PI 3.14159265358979323846
+
+union i2c_smbus_data {
+    uint8_t byte;
+    uint16_t word;
+    uint8_t block[34];
+};
+
+struct i2c_smbus_ioctl_data {
+    char read_write;
+    uint8_t command;
+    int size;
+    union i2c_smbus_data *data;
+};
+
+struct i2c_msg {
+    uint16_t addr;
+    uint16_t flags;
+    uint16_t len;
+    uint8_t *buf;
+};
+
+struct i2c_rdwr_ioctl_data {
+    struct i2c_msg *msgs;
+    uint32_t nmsgs;
+};
 
 typedef enum {
     CHIP_AUTO = 0,
     CHIP_QMC5883L,
+    CHIP_QMC5883P,
     CHIP_HMC5883L,
 } chip_type_t;
 
@@ -32,6 +74,8 @@ typedef struct {
     int interval_ms;
     int once;
     int do_pinmux;
+    int scan;
+    int dump;
 } options_t;
 
 typedef struct {
@@ -45,6 +89,9 @@ typedef struct {
 } mag_sample_t;
 
 static volatile sig_atomic_t keep_running = 1;
+static int current_i2c_addr = -1;
+
+static int i2c_read_reg(int fd, uint8_t reg, uint8_t *buf, size_t len);
 
 static void on_signal(int sig) {
     (void)sig;
@@ -59,11 +106,14 @@ static void usage(const char *argv0) {
         "\n"
         "Options:\n"
         "  --device PATH       I2C device, default " DEFAULT_I2C_DEV "\n"
-        "  --addr auto|0x0d|0x1e\n"
+        "  --addr auto|0x0d|0x1e|0x2c\n"
         "                      I2C address, default auto\n"
-        "  --chip auto|qmc|hmc Sensor core, default auto\n"
+        "  --chip auto|qmc|qmcp|hmc\n"
+        "                      Sensor core, default auto\n"
         "  --interval-ms N     Print interval in ms, default 200\n"
         "  --once              Read one sample and exit\n"
+        "  --scan              Scan the selected I2C bus and exit\n"
+        "  --dump              Dump registers from the selected address and exit\n"
         "  --no-pinmux         Do not run duo-pinmux for GP4/GP5\n"
         "  -h, --help          Show this help\n"
         "\n"
@@ -94,6 +144,8 @@ static int parse_args(int argc, char **argv, options_t *opts) {
     opts->interval_ms = 200;
     opts->once = 0;
     opts->do_pinmux = 1;
+    opts->scan = 0;
+    opts->dump = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -125,6 +177,8 @@ static int parse_args(int argc, char **argv, options_t *opts) {
                 opts->chip = CHIP_AUTO;
             } else if (strcmp(argv[i], "qmc") == 0 || strcmp(argv[i], "qmc5883l") == 0) {
                 opts->chip = CHIP_QMC5883L;
+            } else if (strcmp(argv[i], "qmcp") == 0 || strcmp(argv[i], "qmc5883p") == 0) {
+                opts->chip = CHIP_QMC5883P;
             } else if (strcmp(argv[i], "hmc") == 0 || strcmp(argv[i], "hmc5883l") == 0) {
                 opts->chip = CHIP_HMC5883L;
             } else {
@@ -143,6 +197,10 @@ static int parse_args(int argc, char **argv, options_t *opts) {
             }
         } else if (strcmp(argv[i], "--once") == 0) {
             opts->once = 1;
+        } else if (strcmp(argv[i], "--scan") == 0) {
+            opts->scan = 1;
+        } else if (strcmp(argv[i], "--dump") == 0) {
+            opts->dump = 1;
         } else if (strcmp(argv[i], "--no-pinmux") == 0) {
             opts->do_pinmux = 0;
         } else {
@@ -153,6 +211,8 @@ static int parse_args(int argc, char **argv, options_t *opts) {
 
     if (opts->chip == CHIP_QMC5883L && opts->addr < 0) {
         opts->addr = QMC5883L_ADDR;
+    } else if (opts->chip == CHIP_QMC5883P && opts->addr < 0) {
+        opts->addr = QMC5883P_ADDR;
     } else if (opts->chip == CHIP_HMC5883L && opts->addr < 0) {
         opts->addr = HMC5883L_ADDR;
     }
@@ -177,12 +237,115 @@ static int i2c_select_addr(int fd, int addr) {
         fprintf(stderr, "I2C_SLAVE 0x%02x failed: %s\n", addr, strerror(errno));
         return -1;
     }
+    current_i2c_addr = addr;
+    return 0;
+}
+
+static int i2c_probe_addr(int fd, int addr) {
+    struct i2c_smbus_ioctl_data args;
+    uint8_t byte;
+
+    if (i2c_select_addr(fd, addr) != 0) {
+        return -1;
+    }
+
+    memset(&args, 0, sizeof(args));
+    args.read_write = I2C_SMBUS_WRITE;
+    args.size = I2C_SMBUS_QUICK;
+    if (ioctl(fd, I2C_SMBUS, &args) == 0) {
+        return 0;
+    }
+
+    /*
+     * Some minimal Duo images/adapters do not support SMBus quick probing.
+     * A one-byte receive still tells us whether an address ACKs.
+     */
+    if (read(fd, &byte, 1) == 1) {
+        return 0;
+    }
+
+    return -1;
+}
+
+static int scan_bus(int fd, const char *device) {
+    int found = 0;
+
+    printf("Scanning %s for I2C devices...\n", device);
+    printf("     00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n");
+
+    for (int row = 0; row < 0x80; row += 0x10) {
+        printf("%02x: ", row);
+        for (int col = 0; col < 0x10; col++) {
+            int addr = row + col;
+            if (addr < 0x03 || addr > 0x77) {
+                printf("   ");
+            } else if (i2c_probe_addr(fd, addr) == 0) {
+                printf("%02x ", addr);
+                found++;
+            } else {
+                printf("-- ");
+            }
+        }
+        printf("\n");
+    }
+
+    if (found == 0) {
+        printf("No I2C devices responded on %s.\n", device);
+    } else {
+        printf("Found %d I2C address(es). GY-271 is usually 0x0d, 0x1e, or 0x2c.\n", found);
+    }
+
+    return found > 0 ? 0 : 1;
+}
+
+static int dump_registers(int fd, int addr) {
+    uint8_t value;
+
+    if (i2c_select_addr(fd, addr) != 0) {
+        return 1;
+    }
+
+    printf("Dumping I2C addr 0x%02x registers 0x00..0x2f\n", addr);
+    for (int reg = 0; reg <= 0x2f; reg++) {
+        if ((reg % 0x10) == 0) {
+            printf("%02x: ", reg);
+        }
+
+        errno = 0;
+        if (i2c_read_reg(fd, (uint8_t)reg, &value, 1) == 0) {
+            printf("%02x ", value);
+        } else {
+            printf("?? ");
+        }
+
+        if ((reg % 0x10) == 0x0f) {
+            printf("\n");
+        }
+    }
+    printf("\n");
     return 0;
 }
 
 static int i2c_write_reg(int fd, uint8_t reg, uint8_t value) {
     uint8_t buf[2] = {reg, value};
-    ssize_t n = write(fd, buf, sizeof(buf));
+    struct i2c_msg msg;
+    struct i2c_rdwr_ioctl_data transfer;
+    ssize_t n;
+
+    if (current_i2c_addr >= 0) {
+        memset(&msg, 0, sizeof(msg));
+        msg.addr = (uint16_t)current_i2c_addr;
+        msg.flags = 0;
+        msg.len = sizeof(buf);
+        msg.buf = buf;
+        transfer.msgs = &msg;
+        transfer.nmsgs = 1;
+        if (ioctl(fd, I2C_RDWR, &transfer) == 1) {
+            return 0;
+        }
+    }
+
+    n = write(fd, buf, sizeof(buf));
     if (n != (ssize_t)sizeof(buf)) {
         return -1;
     }
@@ -190,7 +353,30 @@ static int i2c_write_reg(int fd, uint8_t reg, uint8_t value) {
 }
 
 static int i2c_read_reg(int fd, uint8_t reg, uint8_t *buf, size_t len) {
-    ssize_t n = write(fd, &reg, 1);
+    struct i2c_msg msgs[2];
+    struct i2c_rdwr_ioctl_data transfer;
+    uint8_t regbuf = reg;
+    ssize_t n;
+
+    if (current_i2c_addr >= 0) {
+        memset(msgs, 0, sizeof(msgs));
+        msgs[0].addr = (uint16_t)current_i2c_addr;
+        msgs[0].flags = 0;
+        msgs[0].len = 1;
+        msgs[0].buf = &regbuf;
+        msgs[1].addr = (uint16_t)current_i2c_addr;
+        msgs[1].flags = I2C_M_RD;
+        msgs[1].len = (uint16_t)len;
+        msgs[1].buf = buf;
+
+        transfer.msgs = msgs;
+        transfer.nmsgs = 2;
+        if (ioctl(fd, I2C_RDWR, &transfer) == 2) {
+            return 0;
+        }
+    }
+
+    n = write(fd, &reg, 1);
     if (n != 1) {
         return -1;
     }
@@ -258,6 +444,55 @@ static int qmc5883l_read(int fd, mag_sample_t *sample) {
     return 0;
 }
 
+static int qmc5883p_init(int fd) {
+    /*
+     * Keep the init sequence conservative for HP/QMC5883P boards sold as GY-271:
+     * some modules ACK at 0x2c but time out on undocumented sign-register writes.
+     */
+    if (i2c_write_reg(fd, 0x0a, 0xcf) != 0) {
+        fprintf(stderr, "QMC5883P init failed writing reg 0x0a: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /*
+     * Control register 0x0b:
+     * set/reset on, RNG=8G.
+     */
+    if (i2c_write_reg(fd, 0x0b, 0x08) != 0) {
+        fprintf(stderr, "QMC5883P init failed writing reg 0x0b: %s\n", strerror(errno));
+        return -1;
+    }
+
+    usleep(10000);
+    return 0;
+}
+
+static int qmc5883p_read(int fd, mag_sample_t *sample) {
+    uint8_t status = 0;
+    uint8_t buf[6];
+
+    for (int i = 0; i < 20; i++) {
+        if (i2c_read_reg(fd, 0x09, &status, 1) == 0 && (status & 0x01) != 0) {
+            break;
+        }
+        usleep(5000);
+    }
+
+    if (i2c_read_reg(fd, 0x01, buf, sizeof(buf)) != 0) {
+        return -1;
+    }
+
+    sample->x = i16_le(&buf[0]);
+    sample->y = i16_le(&buf[2]);
+    sample->z = i16_le(&buf[4]);
+
+    sample->x_ut = (double)sample->x * 100.0 / 3750.0;
+    sample->y_ut = (double)sample->y * 100.0 / 3750.0;
+    sample->z_ut = (double)sample->z * 100.0 / 3750.0;
+    sample->heading_deg = heading_degrees(sample->x_ut, sample->y_ut);
+    return 0;
+}
+
 static int hmc5883l_init(int fd) {
     if (i2c_write_reg(fd, 0x00, 0x70) != 0) {
         return -1;
@@ -303,6 +538,8 @@ static const char *chip_name(chip_type_t chip) {
     switch (chip) {
     case CHIP_QMC5883L:
         return "QMC5883L";
+    case CHIP_QMC5883P:
+        return "QMC5883P";
     case CHIP_HMC5883L:
         return "HMC5883L";
     case CHIP_AUTO:
@@ -315,6 +552,8 @@ static int init_chip(int fd, chip_type_t chip) {
     switch (chip) {
     case CHIP_QMC5883L:
         return qmc5883l_init(fd);
+    case CHIP_QMC5883P:
+        return qmc5883p_init(fd);
     case CHIP_HMC5883L:
         return hmc5883l_init(fd);
     case CHIP_AUTO:
@@ -327,6 +566,8 @@ static int read_chip(int fd, chip_type_t chip, mag_sample_t *sample) {
     switch (chip) {
     case CHIP_QMC5883L:
         return qmc5883l_read(fd, sample);
+    case CHIP_QMC5883P:
+        return qmc5883p_read(fd, sample);
     case CHIP_HMC5883L:
         return hmc5883l_read(fd, sample);
     case CHIP_AUTO:
@@ -353,7 +594,8 @@ static int probe_one(int fd, chip_type_t chip, int addr) {
 static int detect_chip(int fd, const options_t *opts, chip_type_t *chip, int *addr) {
     if (opts->chip != CHIP_AUTO) {
         int chosen_addr = opts->addr >= 0 ? opts->addr :
-                          (opts->chip == CHIP_QMC5883L ? QMC5883L_ADDR : HMC5883L_ADDR);
+                          (opts->chip == CHIP_QMC5883L ? QMC5883L_ADDR :
+                           opts->chip == CHIP_QMC5883P ? QMC5883P_ADDR : HMC5883L_ADDR);
         if (probe_one(fd, opts->chip, chosen_addr) == 0) {
             *chip = opts->chip;
             *addr = chosen_addr;
@@ -364,7 +606,12 @@ static int detect_chip(int fd, const options_t *opts, chip_type_t *chip, int *ad
     }
 
     if (opts->addr >= 0) {
-        chip_type_t inferred = opts->addr == HMC5883L_ADDR ? CHIP_HMC5883L : CHIP_QMC5883L;
+        chip_type_t inferred = CHIP_QMC5883L;
+        if (opts->addr == HMC5883L_ADDR) {
+            inferred = CHIP_HMC5883L;
+        } else if (opts->addr == QMC5883P_ADDR) {
+            inferred = CHIP_QMC5883P;
+        }
         if (probe_one(fd, inferred, opts->addr) == 0) {
             *chip = inferred;
             *addr = opts->addr;
@@ -380,13 +627,19 @@ static int detect_chip(int fd, const options_t *opts, chip_type_t *chip, int *ad
         return 0;
     }
 
+    if (probe_one(fd, CHIP_QMC5883P, QMC5883P_ADDR) == 0) {
+        *chip = CHIP_QMC5883P;
+        *addr = QMC5883P_ADDR;
+        return 0;
+    }
+
     if (probe_one(fd, CHIP_HMC5883L, HMC5883L_ADDR) == 0) {
         *chip = CHIP_HMC5883L;
         *addr = HMC5883L_ADDR;
         return 0;
     }
 
-    fprintf(stderr, "No GY-271 sensor found at 0x0d or 0x1e on this bus\n");
+    fprintf(stderr, "No GY-271 sensor found at 0x0d, 0x1e, or 0x2c on this bus\n");
     return -1;
 }
 
@@ -430,7 +683,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (opts.scan) {
+        int rc = scan_bus(fd, opts.device);
+        close(fd);
+        return rc;
+    }
+
+    if (opts.dump) {
+        int dump_addr = opts.addr >= 0 ? opts.addr : QMC5883P_ADDR;
+        int rc = dump_registers(fd, dump_addr);
+        close(fd);
+        return rc;
+    }
+
     if (detect_chip(fd, &opts, &chip, &addr) != 0) {
+        fprintf(stderr, "Try scanning this bus with: %s --device %s --scan\n", argv[0], opts.device);
+        fprintf(stderr, "Also verify pinmux: duo-pinmux -r GP4 ; duo-pinmux -r GP5\n");
         close(fd);
         return 1;
     }

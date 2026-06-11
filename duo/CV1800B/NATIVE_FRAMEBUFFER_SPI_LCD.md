@@ -91,6 +91,10 @@ ST7789V 驱动已经编进内核。若换成 ST7789/ST7789V 屏，同一套 SPI2
 4. 如果颜色红蓝反了，可给节点加 `bgr;`。
 5. 官方 ST7789 示例使用 `spi-cpol; spi-cpha;`，也就是 SPI mode 3；当前模板保留了这两行。
 
+## 双屏方案备注
+
+如果要同时保留 GC9A01 表情屏并新增 ST7789V/ST7789V2 控制台屏，优先让 ST7789V 按官方接法占用 Pin12 `SPI2_CS_X`，GC9A01 共享 SPI2 的 Pin9/Pin10，但把 CS 移到新增 GPIO，例如 Pin29 `GP22`。详细接线、DTS 方向和刷新率预期见 `DUAL_SPI_LCD_ST7789V_CONSOLE.md`。
+
 ## 构建与验证
 
 macOS 不能直接运行 SDK 内的 Linux x86_64 toolchain。仓库里已有 Lima 辅助脚本，在仓库根目录执行：

@@ -9,3 +9,9 @@ ssh到duo上的密码是：milkv
 
 duo的引脚定义在这个地址：https://milkv.io/zh/docs/duo/getting-started/duo
 DC接到了5号引脚，SCL接到了9号引脚，SDA接到了10号引脚，CS接到了12号引脚，RST接到了11号引脚
+
+## 当前文档索引
+
+- `PIN_BINDINGS.md`：最早的 GC9A01 单屏接线和 GPIO 编号。
+- `NATIVE_FRAMEBUFFER_SPI_LCD.md`：原生 framebuffer SPI 屏方案，默认记录 GC9A01，也包含 ST7789V 单屏切换说明。
+- `DUAL_SPI_LCD_ST7789V_CONSOLE.md`：新增 ST7789V/ST7789V2 240x320 framebuffer 控制台屏，同时保留 GC9A01 表情屏的双屏方案。
