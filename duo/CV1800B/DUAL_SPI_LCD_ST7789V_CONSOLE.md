@@ -13,6 +13,8 @@
 - Duo 上虽然能看到 `/dev/spidev0.0` 和 `/dev/spidev1.0`，但 40pin 排针上最适合接屏的是 SPI2。SPI3 主要落在 MIPI 相关 PAD，不建议作为普通外接第二屏的接线方案。
 - 两块屏共用 SPI2 会影响同时全屏刷新率；但 ST7789V 作为命令行屏、GC9A01 作为低帧率/局部刷新的表情屏，方案可行。
 - 预留 USB 键盘时不要把 USB D+/D- 接到 GP4/GP5；GP4/GP5 不是 USB 数据线。
+- 真正的 Linux 控制台需要打开 VT/fbcon/HID/input 相关内核配置；当前目标 defconfig 里 `CONFIG_VT` 仍是关闭状态。
+- Duo 只有一个主要 USB OTG 口；如果切成 USB host 接键盘，原来的 USB-NCM/RNDIS SSH 网络通常不能同时保留，需要以太网或串口兜底。
 
 参考：
 
@@ -134,7 +136,6 @@ DTS 方向示意：
 &spi2 {
 	status = "okay";
 	num-cs = <2>;
-	cs-gpios = <0>, <&porte 4 GPIO_ACTIVE_LOW>; /* CS0=native GP9, CS1=GP22 */
 
 	/delete-node/ spidev@0;
 
@@ -142,7 +143,7 @@ DTS 方向示意：
 		compatible = "sitronix,st7789v";
 		reg = <0>;
 		status = "okay";
-		spi-max-frequency = <48000000>;
+		spi-max-frequency = <24000000>;
 		spi-cpol;
 		spi-cpha;
 		width = <240>;
@@ -159,16 +160,34 @@ DTS 方向示意：
 		compatible = "rohm,dh2228fv";
 		reg = <1>;
 		status = "okay";
-		spi-max-frequency = <8000000>;
+		spi-max-frequency = <12000000>;
 	};
 };
 ```
 
 注意：
 
-- 这个 `cs-gpios` 写法需要在真机上验证 CV1800B SPI 控制器是否按预期处理 native CS + GPIO CS。
+- 本次定制镜像先不在 DTS 里把 GP22 声明成 SPI `cs-gpios`，而是让 GC9A01 用户态程序手动拉 GP22 做 CS；这是最接近已跑通单屏程序的迁移方式。
 - 如果 GC9A01 改走 `/dev/spidev0.1`，表情程序里的 SPI 设备路径要从 `/dev/spidev0.0` 改成 `/dev/spidev0.1`。
-- 表情程序当前会手动控制 CS GPIO。若 DTS 已经把 GP22 作为 SPI core 的 `cs-gpios`，程序里不要再 export/toggle 同一个 CS GPIO；应改成由 SPI core 控制 CS，或另行验证“手动 CS + dummy chip-select”的方案。
+- 如果后续改成 DTS `cs-gpios` 由 SPI core 控制 GP22，程序里不要再 export/toggle 同一个 CS GPIO；应改成 `GC9A01_GPIO_CS=-1`。
+
+当前 `c-gc9a01/test_hw_spi.c` 和 `c-gc9a01/eye_anim.c` 已支持环境变量切换接线。本次定制镜像使用：
+
+```bash
+GC9A01_SPI_DEV=/dev/spidev0.1 \
+GC9A01_GPIO_CS=356 \
+GC9A01_PINMUX_CS=GP22/GP22 \
+/root/eye-anim /root/eye_animation.bin 20 12000000 auto
+```
+
+如果之后 `/dev/spidev0.1` 的 CS 改由 DTS `cs-gpios` 绑定到 GP22，则运行命令改成：
+
+```bash
+GC9A01_SPI_DEV=/dev/spidev0.1 \
+GC9A01_GPIO_CS=-1 \
+GC9A01_PINMUX_CS=none \
+/root/eye-anim /root/eye_animation.bin 20 12000000 auto
+```
 
 ### 路线 B：两块屏都做 framebuffer
 
@@ -183,20 +202,31 @@ DTS 方向示意：
 
 ## Linux 命令行显示到 ST7789V
 
-ST7789V 注册成 `/dev/fb0` 之后，还不等于自动显示系统命令行。当前 SDK 配置里曾看到 `CONFIG_VT` 是关闭的；要做真正的 Linux 控制台，至少要关注：
+ST7789V 注册成 `/dev/fb0` 之后，还不等于自动显示系统命令行。当前目标板配置已有 `CONFIG_FB=y`、`CONFIG_INPUT_EVDEV=y`、`CONFIG_FB_TFT_ST7789V=y`，但 `CONFIG_VT` 仍是关闭状态；要做真正的 Linux 控制台，至少要关注：
 
 ```text
 CONFIG_VT
 CONFIG_VT_CONSOLE
 CONFIG_HW_CONSOLE
 CONFIG_FRAMEBUFFER_CONSOLE
+CONFIG_DUMMY_CONSOLE
+CONFIG_FONT_8x8
+CONFIG_FONT_8x16
 CONFIG_INPUT
+CONFIG_INPUT_EVDEV
 CONFIG_INPUT_KEYBOARD
 CONFIG_HID
+CONFIG_HID_GENERIC
 CONFIG_USB_HID
 ```
 
-还需要启动 getty/console，或通过 fbcon 参数把控制台映射到目标 framebuffer。
+还需要启动 getty/console，或通过 fbcon 参数把控制台映射到目标 framebuffer。启动参数方向可以先按下面思路验证：
+
+```text
+console=tty0 fbcon=map:0
+```
+
+实际镜像里仍建议保留串口或 USB gadget 登录作为救援入口，避免 framebuffer 控制台没起来时失联。
 
 如果先不做内核虚拟控制台，也可以走用户态终端渲染方案：程序读 `/dev/input/event*`，把终端文本画到 `/dev/fb0`。
 
@@ -219,14 +249,14 @@ CONFIG_USB_HID
 - GC9A01 表情屏建议 10-20fps，优先局部刷新或降低动画刷新频率。
 - 如果 GC9A01 仍用 8 MHz，表情屏全屏刷新会明显慢；稳定后可以逐步提高它的 `spi-max-frequency` 或用户态 SPI speed。
 
-## USB 键盘预留
+## 键盘输入方案
 
 不要把 USB 母口的 D+/D- 接到 GP4/GP5：
 
 - GP4/GP5 是普通 GPIO/I2C/UART/PWM 复用脚，不是 USB 差分数据线。
 - 之前 GY-271 磁力计也用过 GP4/GP5 做 I2C1，接 USB 会冲突且不会被 Linux 识别成键盘。
 
-USB-A 母口给键盘需要真实 USB：
+### 方案 A：USB host 键盘，最像普通 Linux
 
 | USB-A | 应接到 |
 | --- | --- |
@@ -235,15 +265,113 @@ USB-A 母口给键盘需要真实 USB：
 | D+ | Duo 真实 USB D+ |
 | D- | Duo 真实 USB D- |
 
-推荐使用官方 USB/Ethernet IO Board，或从 Duo 的真实 USB OTG 口做 host。切到 USB host 后，原来的 USB-NCM/RNDIS 网络通常不能同时继续使用，需要准备串口、以太网或其他登录方式。
+推荐使用官方 USB/Ethernet IO Board，或从 Duo 的真实 USB OTG 口做 host。内核方向：
+
+```text
+CONFIG_USB=y
+CONFIG_USB_DWC2=y
+CONFIG_USB_ROLE_SWITCH=y
+CONFIG_INPUT=y
+CONFIG_INPUT_EVDEV=y
+CONFIG_HID=y
+CONFIG_HID_GENERIC=y
+CONFIG_USB_HID=y
+```
+
+验证命令：
+
+```bash
+dmesg | grep -Ei 'usb|hid|keyboard|input'
+cat /proc/bus/input/devices
+ls -l /dev/input/event*
+```
+
+缺点是 Duo 的 USB OTG 口切成 host 后，原来的 USB-NCM/RNDIS 网络通常不能同时继续使用。这个方案适合最终形态，但要提前准备以太网或串口救援。
+
+### 方案 B：UART/I2C 小键盘，保留 USB 网络
+
+开发阶段更稳的组合是：USB 仍然保持 gadget 网络用于 SSH，键盘走一个小 MCU 或 I2C/GPIO 扩展。
+
+可选实现：
+
+- MCU 方案：RP2040/ESP32/Pro Micro 等接实体键盘或按键矩阵，再用 UART/I2C 把按键事件发给 Duo。
+- Duo 用户态守护进程读取 `/dev/ttyS*` 或 I2C，再通过 `/dev/uinput` 注入 Linux input 事件。若走这条路，内核加 `CONFIG_INPUT_UINPUT`。
+- 如果暂时只需要方向键、Enter、Esc、Tab 等少量按键，可以直接用 `gpio-keys` 或矩阵键盘 DTS；但全键盘不建议直接吃 Duo 的 GPIO。
+
+这个方案软件多一点，但不会占用 USB OTG 口，适合一边 SSH 调试、一边在 ST7789V 上看真实控制台或用户态终端。
+
+## 网络连接方案
+
+### 方案 A：开发期保留 USB gadget 网络
+
+当前 Duo 常用 `192.168.42.1` 登录，目标 defconfig 也已经启用：
+
+```text
+CONFIG_USB_GADGET=y
+CONFIG_USB_CONFIGFS=y
+CONFIG_USB_CONFIGFS_NCM=y
+CONFIG_USB_CONFIGFS_RNDIS=y
+```
+
+这条路线最适合开发和刷机验证：
+
+- 电脑通过 USB-NCM/RNDIS SSH 到 Duo。
+- 文件传输继续用 `scp -O` 兼容 Dropbear。
+- 键盘输入优先走 UART/I2C MCU、小按键，或先用 SSH 远程输入。
+- 外网可以尝试电脑网络共享/NAT；如果网络环境不允许，至少本机 SSH 与 scp 不受影响。
+
+### 方案 B：最终形态使用以太网
+
+如果要 USB host 接键盘，同时还希望 Duo 有网络，优先考虑以太网：
+
+- 官方 USB/Ethernet IO Board 或 100M Ethernet 扩展作为主网络出口。
+- 当前目标 defconfig 已有 `CONFIG_STMMAC_ETH=y`，后续重点是确认板级 DTS、PHY、RJ45/IO Board 接线和 rootfs 自动 DHCP。
+- rootfs 里建议保留 BusyBox `udhcpc`，启动后用 `udhcpc -i eth0` 或 init 脚本自动拿地址。
+
+### 方案 C：USB host + USB 网卡/无线
+
+如果最终要用 USB host，理论上可以接 powered USB hub，同时挂 USB 键盘和 USB 网卡。需要额外打开对应 host 网卡驱动，例如：
+
+```text
+CONFIG_USB_USBNET
+CONFIG_USB_NET_CDCETHER
+CONFIG_USB_NET_RNDIS_HOST
+CONFIG_USB_NET_AX8817X
+CONFIG_USB_NET_AX88179_178A
+CONFIG_USB_RTL8152
+```
+
+USB Wi-Fi 也能做，但会引入芯片驱动、firmware、`wpa_supplicant` 和供电稳定性问题，不建议作为第一版网络方案。
+
+### 推荐组合
+
+第一阶段开发：
+
+```text
+ST7789V /dev/fb0 真控制台
+GC9A01 /dev/spidev0.1 表情屏
+USB gadget 网络继续 SSH
+UART/I2C MCU 或少量 GPIO keys 做本地输入
+```
+
+第二阶段独立运行：
+
+```text
+ST7789V /dev/fb0 真控制台
+GC9A01 表情屏
+USB host HID 键盘
+以太网作为网络出口
+串口作为救援入口
+```
 
 ## 下一台电脑继续处理清单
 
 1. 硬件先按本文接线，把 ST7789V 接官方 Pin12 CS，把 GC9A01 CS 移到 Pin29 GP22。
 2. 在 SDK DTS 里把 SPI2 改成 ST7789V `display@0` + GC9A01 `spidev@1` 或第二个 framebuffer。
 3. 在 U-Boot pinmux 里确认 GP16/GP17/GP3/GP8/GP22 都是 GPIO，GP6/GP7/GP9 是 SPI2。
-4. 打开 framebuffer console、VT、USB HID keyboard 相关内核配置。
-5. 烧录后先确认：
+4. 打开 framebuffer console、VT、USB HID keyboard 相关内核配置；如果走 MCU 注入按键，再加 `CONFIG_INPUT_UINPUT`。
+5. 先决定 USB 角色：开发期保留 USB gadget 网络，最终形态再切 USB host 键盘并改用以太网。
+6. 烧录后先确认：
 
 ```bash
 ls -l /dev/fb* /dev/spidev*
@@ -251,11 +379,12 @@ dmesg | grep -Ei 'st7789|gc9a01|fb_tft|spi'
 cat /sys/class/graphics/fb0/name
 ```
 
-6. 先用 ST7789V 验证 `/dev/fb0`：
+7. 先用 ST7789V 验证 `/dev/fb0`：
 
 ```bash
 cat /dev/zero > /dev/fb0
 cat /dev/random > /dev/fb0
 ```
 
-7. 再迁移表情程序到 `/dev/spidev0.1`，并把 CS 改为 GP22，或改成 SPI core 自动 CS。
+8. 再迁移表情程序到 `/dev/spidev0.1`，并把 CS 改为 GP22，或改成 SPI core 自动 CS。
+9. 最后验证输入和网络：`cat /proc/bus/input/devices`、`ls /dev/input/event*`、`ip addr`、`udhcpc -i eth0`。

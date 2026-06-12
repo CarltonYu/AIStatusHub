@@ -19,6 +19,41 @@ The current wiring matches Duo SPI2 for the data pins:
 `test_hw_spi.c` uses `/dev/spidev0.0` for SPI2 clock/MOSI on the tested
 official image and controls DC/CS/RST through sysfs GPIO.
 
+For the dual-screen ST7789V console setup, keep SCL/SDA on SPI2, move the
+GC9A01 CS line away from Pin 12, and override the runtime wiring with
+environment variables.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `GC9A01_SPI_DEV` | `/dev/spidev0.0` | SPI device path |
+| `GC9A01_GPIO_DC` | `377` | Manual DC GPIO |
+| `GC9A01_GPIO_RST` | `373` | Manual reset GPIO |
+| `GC9A01_GPIO_CS` | `370` | Manual CS GPIO; use `-1` to let SPI core drive CS |
+| `GC9A01_PINMUX_DC` | `GP3/GP3` | Pinmux for DC |
+| `GC9A01_PINMUX_RST` | `GP8/GP8` | Pinmux for reset |
+| `GC9A01_PINMUX_CS` | `GP9/GP9` | Pinmux for manual CS |
+| `GC9A01_PINMUX_SCK` | `GP6/SPI2_SCK` | Pinmux for SPI clock |
+| `GC9A01_PINMUX_MOSI` | `GP7/SPI2_SDO` | Pinmux for SPI MOSI |
+
+Example with GC9A01 manual CS moved to Pin 29 / GP22:
+
+```bash
+GC9A01_SPI_DEV=/dev/spidev0.1 \
+GC9A01_GPIO_CS=356 \
+GC9A01_PINMUX_CS=GP22/GP22 \
+/root/eye-anim /root/eye_animation.bin 20 12000000 auto
+```
+
+If the DTS maps GP22 as SPI core `cs-gpios` for `/dev/spidev0.1`, do not export
+the same GPIO from userspace. Disable manual CS instead:
+
+```bash
+GC9A01_SPI_DEV=/dev/spidev0.1 \
+GC9A01_GPIO_CS=-1 \
+GC9A01_PINMUX_CS=none \
+/root/eye-anim /root/eye_animation.bin 20 12000000 auto
+```
+
 ## Important Pinmux Detail
 
 The official Duo image may boot with:
@@ -82,8 +117,10 @@ Run on Duo:
 ```
 
 `eye-anim` now sets the required `duo-pinmux` modes automatically, matching the
-pin binding above. In `auto` mode it preloads small animation files into RAM and
-streams larger 240-frame files from storage to avoid memory pressure on Duo.
+pin binding above. The same environment variables listed earlier also apply to
+`eye-anim`, so the binary can be reused after moving GC9A01 from Pin 12 to GP22.
+In `auto` mode it preloads small animation files into RAM and streams larger
+240-frame files from storage to avoid memory pressure on Duo.
 
 ### Why frame-rate is limited
 

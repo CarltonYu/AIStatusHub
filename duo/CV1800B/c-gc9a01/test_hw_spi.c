@@ -9,18 +9,70 @@
 #include <linux/spi/spidev.h>
 
 #define GPIO_SYSFS_PATH "/sys/class/gpio"
-#define SPI_DEVICE_PATH "/dev/spidev0.0"
+#define DEFAULT_SPI_DEVICE_PATH "/dev/spidev0.0"
 #define SPI_SPEED_HZ 8000000
 
-// Correct sysfs GPIO numbers for MilkV Duo
-#define PIN_DC   377   // Pin5 = GP3 = PWR_GPIO[25]
-#define PIN_RST  373   // Pin11 = GP8 = PWR_GPIO[21]
-#define PIN_CS   370   // Pin12 = GP9 = PWR_GPIO[18]
+// Default wiring: Pin5=DC, Pin11=RST, Pin12=manual CS.
+static const char *g_spi_device_path = DEFAULT_SPI_DEVICE_PATH;
+static int g_pin_dc = 377;   // Pin5 = GP3 = PWR_GPIO[25]
+static int g_pin_rst = 373;  // Pin11 = GP8 = PWR_GPIO[21]
+static int g_pin_cs = 370;   // Pin12 = GP9 = PWR_GPIO[18], -1 disables manual CS
 
-static void run_pinmux(const char *cmd) {
-    int rc = system(cmd);
-    if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
-        fprintf(stderr, "warning: pinmux command failed: %s\n", cmd);
+static const char *g_pinmux_dc = "GP3/GP3";
+static const char *g_pinmux_sck = "GP6/SPI2_SCK";
+static const char *g_pinmux_mosi = "GP7/SPI2_SDO";
+static const char *g_pinmux_rst = "GP8/GP8";
+static const char *g_pinmux_cs = "GP9/GP9";
+
+static int env_int(const char *name, int current) {
+    const char *value = getenv(name);
+    char *end = NULL;
+    long parsed;
+
+    if (!value || !*value) return current;
+    parsed = strtol(value, &end, 10);
+    if (!end || *end != '\0') {
+        fprintf(stderr, "warning: ignoring invalid %s=%s\n", name, value);
+        return current;
+    }
+    return (int)parsed;
+}
+
+static const char *env_str(const char *name, const char *current) {
+    const char *value = getenv(name);
+    return (value && *value) ? value : current;
+}
+
+static void load_config_from_env(void) {
+    g_spi_device_path = env_str("GC9A01_SPI_DEV", g_spi_device_path);
+    g_pin_dc = env_int("GC9A01_GPIO_DC", g_pin_dc);
+    g_pin_rst = env_int("GC9A01_GPIO_RST", g_pin_rst);
+    g_pin_cs = env_int("GC9A01_GPIO_CS", g_pin_cs);
+
+    g_pinmux_dc = env_str("GC9A01_PINMUX_DC", g_pinmux_dc);
+    g_pinmux_sck = env_str("GC9A01_PINMUX_SCK", g_pinmux_sck);
+    g_pinmux_mosi = env_str("GC9A01_PINMUX_MOSI", g_pinmux_mosi);
+    g_pinmux_rst = env_str("GC9A01_PINMUX_RST", g_pinmux_rst);
+    g_pinmux_cs = env_str("GC9A01_PINMUX_CS", g_pinmux_cs);
+}
+
+static void run_pinmux(const char *mux) {
+    pid_t pid;
+    int status;
+
+    if (!mux || !*mux || strcmp(mux, "none") == 0 || strcmp(mux, "-") == 0) return;
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork duo-pinmux");
+        return;
+    }
+    if (pid == 0) {
+        execlp("duo-pinmux", "duo-pinmux", "-w", mux, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "warning: pinmux command failed: duo-pinmux -w %s\n", mux);
     }
 }
 
@@ -31,11 +83,11 @@ static void configure_pinmux(void) {
      * SCK/MOSI stay on SPI2. CS is controlled manually as GPIO for stable
      * display command/data framing.
      */
-    run_pinmux("duo-pinmux -w GP3/GP3 >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP6/SPI2_SCK >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP7/SPI2_SDO >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP8/GP8 >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP9/GP9 >/dev/null 2>&1");
+    run_pinmux(g_pinmux_dc);
+    run_pinmux(g_pinmux_sck);
+    run_pinmux(g_pinmux_mosi);
+    run_pinmux(g_pinmux_rst);
+    run_pinmux(g_pinmux_cs);
 }
 
 static int gpio_export(int pin) {
@@ -72,12 +124,14 @@ static int gpio_open_value(int pin) {
 }
 
 static int gpio_prepare(int pin) {
+    if (pin < 0) return -1;
     if (gpio_export(pin) < 0) return -1;
     if (gpio_set_direction(pin, "out") < 0) return -1;
     return gpio_open_value(pin);
 }
 
 static int gset(int fd, int v) {
+    if (fd < 0) return 0;
     if (lseek(fd, 0, SEEK_SET) < 0) {
         perror("gpio lseek");
         return -1;
@@ -147,31 +201,39 @@ static int fill_screen(int spi, int dc, int cs, uint16_t color) {
 
 int main() {
     int spi, dc, rst, cs;
-    printf("GC9A01 HW SPI2 test (spidev0.0)\n");
+    load_config_from_env();
+
+    printf("GC9A01 HW SPI test (%s)\n", g_spi_device_path);
+    printf("GPIO DC=%d RST=%d CS=%d (%s)\n",
+           g_pin_dc, g_pin_rst, g_pin_cs,
+           g_pin_cs < 0 ? "SPI core CS" : "manual CS");
 
     configure_pinmux();
 
-    dc = gpio_prepare(PIN_DC);
-    rst = gpio_prepare(PIN_RST);
-    cs = gpio_prepare(PIN_CS);
-    if (dc < 0 || rst < 0 || cs < 0) {
+    dc = gpio_prepare(g_pin_dc);
+    rst = gpio_prepare(g_pin_rst);
+    cs = gpio_prepare(g_pin_cs);
+    if (dc < 0 || rst < 0 || (g_pin_cs >= 0 && cs < 0)) {
         fprintf(stderr, "GPIO open failed\n"); return 1;
     }
     gset(cs, 1);
     gset(dc, 1);
     gset(rst, 1);
 
-    spi = open(SPI_DEVICE_PATH, O_RDWR);
-    if (spi < 0) { perror("open spidev0.0"); return 1; }
+    spi = open(g_spi_device_path, O_RDWR);
+    if (spi < 0) { perror("open spidev"); return 1; }
 
-    uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
+    uint8_t mode = g_pin_cs < 0 ? SPI_MODE_0 : (SPI_MODE_0 | SPI_NO_CS);
     uint8_t bits = 8;
     uint32_t speed = SPI_SPEED_HZ;
-    if (ioctl(spi, SPI_IOC_WR_MODE, &mode) < 0) {
+    if (g_pin_cs >= 0 && ioctl(spi, SPI_IOC_WR_MODE, &mode) < 0) {
         perror("SPI_IOC_WR_MODE with SPI_NO_CS");
         fprintf(stderr, "warning: falling back to SPI_MODE_0 with manual GPIO CS\n");
         mode = SPI_MODE_0;
         if (ioctl(spi, SPI_IOC_WR_MODE, &mode) < 0) { perror("SPI_IOC_WR_MODE"); return 1; }
+    } else if (g_pin_cs < 0 && ioctl(spi, SPI_IOC_WR_MODE, &mode) < 0) {
+        perror("SPI_IOC_WR_MODE");
+        return 1;
     }
     if (ioctl(spi, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) { perror("SPI_IOC_WR_BITS_PER_WORD"); return 1; }
     if (ioctl(spi, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) { perror("SPI_IOC_WR_MAX_SPEED_HZ"); return 1; }

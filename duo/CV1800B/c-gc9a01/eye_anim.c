@@ -12,33 +12,81 @@
 
 #define GPIO_SYSFS_PATH "/sys/class/gpio"
 
-// Correct sysfs GPIO numbers for MilkV Duo (PWR_GPIO bank)
-#define PIN_DC   377
-#define PIN_RST  373
-#define PIN_CS   370
-
-#define SPI_DEV_PATH  "/dev/spidev0.0"
+#define DEFAULT_SPI_DEV_PATH  "/dev/spidev0.0"
 #define DEFAULT_SPI_SPEED_HZ  20000000
 #define DEFAULT_FPS           60
 #define DEFAULT_CHUNK_SIZE    4096
 #define PRELOAD_LIMIT_BYTES   (12U * 1024U * 1024U)
 
+static const char *g_spi_dev_path = DEFAULT_SPI_DEV_PATH;
+static int g_pin_dc = 377;
+static int g_pin_rst = 373;
+static int g_pin_cs = 370;
+static const char *g_pinmux_dc = "GP3/GP3";
+static const char *g_pinmux_sck = "GP6/SPI2_SCK";
+static const char *g_pinmux_mosi = "GP7/SPI2_SDO";
+static const char *g_pinmux_rst = "GP8/GP8";
+static const char *g_pinmux_cs = "GP9/GP9";
 static uint32_t g_spi_speed_hz = DEFAULT_SPI_SPEED_HZ;
 static size_t g_chunk_size = DEFAULT_CHUNK_SIZE;
 
-static void run_pinmux(const char *cmdline) {
-    int rc = system(cmdline);
-    if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
-        fprintf(stderr, "warning: pinmux command failed: %s\n", cmdline);
+static int env_int(const char *name, int current) {
+    const char *value = getenv(name);
+    char *end = NULL;
+    long parsed;
+
+    if (!value || !*value) return current;
+    parsed = strtol(value, &end, 10);
+    if (!end || *end != '\0') {
+        fprintf(stderr, "warning: ignoring invalid %s=%s\n", name, value);
+        return current;
+    }
+    return (int)parsed;
+}
+
+static const char *env_str(const char *name, const char *current) {
+    const char *value = getenv(name);
+    return (value && *value) ? value : current;
+}
+
+static void load_config_from_env(void) {
+    g_spi_dev_path = env_str("GC9A01_SPI_DEV", g_spi_dev_path);
+    g_pin_dc = env_int("GC9A01_GPIO_DC", g_pin_dc);
+    g_pin_rst = env_int("GC9A01_GPIO_RST", g_pin_rst);
+    g_pin_cs = env_int("GC9A01_GPIO_CS", g_pin_cs);
+    g_pinmux_dc = env_str("GC9A01_PINMUX_DC", g_pinmux_dc);
+    g_pinmux_sck = env_str("GC9A01_PINMUX_SCK", g_pinmux_sck);
+    g_pinmux_mosi = env_str("GC9A01_PINMUX_MOSI", g_pinmux_mosi);
+    g_pinmux_rst = env_str("GC9A01_PINMUX_RST", g_pinmux_rst);
+    g_pinmux_cs = env_str("GC9A01_PINMUX_CS", g_pinmux_cs);
+}
+
+static void run_pinmux(const char *mux) {
+    pid_t pid;
+    int status;
+
+    if (!mux || !*mux || strcmp(mux, "none") == 0 || strcmp(mux, "-") == 0) return;
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork duo-pinmux");
+        return;
+    }
+    if (pid == 0) {
+        execlp("duo-pinmux", "duo-pinmux", "-w", mux, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "warning: pinmux command failed: duo-pinmux -w %s\n", mux);
     }
 }
 
 static void configure_pinmux(void) {
-    run_pinmux("duo-pinmux -w GP3/GP3 >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP6/SPI2_SCK >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP7/SPI2_SDO >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP8/GP8 >/dev/null 2>&1");
-    run_pinmux("duo-pinmux -w GP9/GP9 >/dev/null 2>&1");
+    run_pinmux(g_pinmux_dc);
+    run_pinmux(g_pinmux_sck);
+    run_pinmux(g_pinmux_mosi);
+    run_pinmux(g_pinmux_rst);
+    run_pinmux(g_pinmux_cs);
 }
 
 static size_t detect_spidev_bufsiz(void) {
@@ -53,6 +101,7 @@ static size_t detect_spidev_bufsiz(void) {
 
 static int gpio_export(int pin) {
     char path[128];
+    if (pin < 0) return 0;
     snprintf(path, sizeof(path), "%s/gpio%d", GPIO_SYSFS_PATH, pin);
     if (access(path, F_OK) == 0) return 0;
     int fd = open(GPIO_SYSFS_PATH "/export", O_WRONLY);
@@ -64,6 +113,7 @@ static int gpio_export(int pin) {
 
 static int gpio_set_dir(int pin, const char *dir) {
     char path[128];
+    if (pin < 0) return 0;
     snprintf(path, sizeof(path), "%s/gpio%d/direction", GPIO_SYSFS_PATH, pin);
     int fd = open(path, O_WRONLY);
     if (fd < 0) return -1;
@@ -72,11 +122,13 @@ static int gpio_set_dir(int pin, const char *dir) {
 
 static int gpio_open(int pin) {
     char path[128];
+    if (pin < 0) return -1;
     snprintf(path, sizeof(path), "%s/gpio%d/value", GPIO_SYSFS_PATH, pin);
     return open(path, O_WRONLY);
 }
 
 static inline void gset(int fd, int v) {
+    if (fd < 0) return;
     lseek(fd, 0, SEEK_SET);
     write(fd, v ? "1" : "0", 1);
 }
@@ -265,6 +317,8 @@ int main(int argc, char **argv) {
 
     uint32_t frame_delay_us = target_fps ? (1000000U / target_fps) : 0;
 
+    load_config_from_env();
+
     setbuf(stdout, NULL);
     printf("OpenEmo Animated Eye for MilkV Duo\n");
     if (target_fps) {
@@ -275,21 +329,24 @@ int main(int argc, char **argv) {
     }
     printf("Usage: %s [bin_path] [target_fps, 0=uncapped] [spi_speed_hz] [auto|preload|stream]\n",
            argv[0]);
+    printf("SPI device: %s, GPIO DC=%d RST=%d CS=%d (%s)\n",
+           g_spi_dev_path, g_pin_dc, g_pin_rst, g_pin_cs,
+           g_pin_cs < 0 ? "SPI core CS" : "manual CS");
 
     configure_pinmux();
-    gpio_export(PIN_DC); gpio_export(PIN_RST); gpio_export(PIN_CS);
-    gpio_set_dir(PIN_DC, "out");
-    gpio_set_dir(PIN_RST, "out");
-    gpio_set_dir(PIN_CS, "out");
+    gpio_export(g_pin_dc); gpio_export(g_pin_rst); gpio_export(g_pin_cs);
+    gpio_set_dir(g_pin_dc, "out");
+    gpio_set_dir(g_pin_rst, "out");
+    gpio_set_dir(g_pin_cs, "out");
 
-    int dc = gpio_open(PIN_DC);
-    int rst = gpio_open(PIN_RST);
-    int cs = gpio_open(PIN_CS);
-    if (dc < 0 || rst < 0 || cs < 0) {
+    int dc = gpio_open(g_pin_dc);
+    int rst = gpio_open(g_pin_rst);
+    int cs = gpio_open(g_pin_cs);
+    if (dc < 0 || rst < 0 || (g_pin_cs >= 0 && cs < 0)) {
         fprintf(stderr, "GPIO open failed\n"); return 1;
     }
 
-    int spi = open(SPI_DEV_PATH, O_RDWR);
+    int spi = open(g_spi_dev_path, O_RDWR);
     if (spi < 0) { perror("open spidev"); return 1; }
 
     uint32_t mode = SPI_MODE_0;
