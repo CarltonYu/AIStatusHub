@@ -1,0 +1,38 @@
+diff --git a/drivers/spi/spi-dw-core.c b/drivers/spi/spi-dw-core.c
+index 1234567..abcdefg 100644
+--- a/drivers/spi/spi-dw-core.c
++++ b/drivers/spi/spi-dw-core.c
+@@ -211,6 +211,7 @@ static irqreturn_t dw_spi_transfer_handler(struct dw_spi *dws)
+ 	if (dw_spi_check_status(dws, false)) {
++		dw_writel(dws, DW_SPI_SER, 0);
+ 		spi_finalize_current_transfer(dws->master);
+ 		return IRQ_HANDLED;
+ 	}
+@@ -222,6 +223,7 @@ static irqreturn_t dw_spi_transfer_handler(struct dw_spi *dws)
+ 	dw_reader(dws);
+ 	if (!dws->rx_len) {
+ 		spi_mask_intr(dws, 0xff);
++		dw_writel(dws, DW_SPI_SER, 0);
+ 		spi_finalize_current_transfer(dws->master);
+ 	} else if (dws->rx_len <= dw_readl(dws, DW_SPI_RXFTLR)) {
+ 		dw_writel(dws, DW_SPI_RXFTLR, dws->rx_len - 1);
+@@ -440,6 +442,7 @@ static int dw_spi_transfer_one(struct spi_controller *master,
+ 	}
+ 
+ 	spi_enable_chip(dws, 1);
++	dw_writel(dws, DW_SPI_SER, BIT(spi->chip_select));
+ 
+ 	if (dws->dma_mapped)
+ 		return dws->dma_ops->dma_transfer(dws, transfer);
+@@ -447,7 +450,11 @@ static int dw_spi_transfer_one(struct spi_controller *master,
+ 		dw_spi_irq_setup(dws);
+ 		return 1;
+ 	}
+-	return dw_spi_poll_transfer(dws, transfer);
++
++	ret = dw_spi_poll_transfer(dws, transfer);
++	dw_writel(dws, DW_SPI_SER, 0);
++	return ret;
+ }
+ 
+ static void dw_spi_handle_err(struct spi_controller *master,

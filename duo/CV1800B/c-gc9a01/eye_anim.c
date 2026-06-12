@@ -9,26 +9,85 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <linux/spi/spidev.h>
+#include <dirent.h>
 
 #define GPIO_SYSFS_PATH "/sys/class/gpio"
 
-#define DEFAULT_SPI_DEV_PATH  "/dev/spidev0.0"
+#define DEFAULT_SPI_DEV_PATH  "/dev/spidev0.1"
 #define DEFAULT_SPI_SPEED_HZ  20000000
 #define DEFAULT_FPS           60
 #define DEFAULT_CHUNK_SIZE    4096
 #define PRELOAD_LIMIT_BYTES   (12U * 1024U * 1024U)
 
 static const char *g_spi_dev_path = DEFAULT_SPI_DEV_PATH;
-static int g_pin_dc = 377;
-static int g_pin_rst = 373;
-static int g_pin_cs = 370;
+static int g_pin_dc = -1;    /* Pin5  GP3  PWR_GPIO[25] - auto-detected */
+static int g_pin_rst = -1;   /* Pin11 GP8  PWR_GPIO[21] - auto-detected */
+static int g_pin_cs = -1;    /* Pin29 GP22 PWR_GPIO[4]: now managed by SPI core cs-gpios */
 static const char *g_pinmux_dc = "GP3/GP3";
 static const char *g_pinmux_sck = "GP6/SPI2_SCK";
 static const char *g_pinmux_mosi = "GP7/SPI2_SDO";
 static const char *g_pinmux_rst = "GP8/GP8";
-static const char *g_pinmux_cs = "GP9/GP9";
+static const char *g_pinmux_cs = "none";
 static uint32_t g_spi_speed_hz = DEFAULT_SPI_SPEED_HZ;
 static size_t g_chunk_size = DEFAULT_CHUNK_SIZE;
+
+/* Try to map a PWR_GPIO offset to a /sys/class/gpio number by looking at the
+ * gpiochip labels.  On CV1800B PWR_GPIO lives on the controller at 0x05021000,
+ * which appears as a gpiochip whose label contains "5021000.gpio" (or "porte").
+ */
+static int gpio_sysfs_number_for(const char *pattern, int offset)
+{
+    DIR *d = opendir(GPIO_SYSFS_PATH);
+    struct dirent *e;
+    int found = -1;
+
+    if (!d) return -1;
+    while ((e = readdir(d))) {
+        char label_path[128], base_path[128], label[64];
+        int base;
+        FILE *f;
+
+        if (strncmp(e->d_name, "gpiochip", 8) != 0)
+            continue;
+        snprintf(label_path, sizeof(label_path), "%s/%s/label",
+                 GPIO_SYSFS_PATH, e->d_name);
+        snprintf(base_path, sizeof(base_path), "%s/%s/base",
+                 GPIO_SYSFS_PATH, e->d_name);
+        f = fopen(label_path, "r");
+        if (!f) continue;
+        if (!fgets(label, sizeof(label), f)) { fclose(f); continue; }
+        fclose(f);
+        label[strcspn(label, "\n")] = '\0';
+        if (!strstr(label, pattern))
+            continue;
+        f = fopen(base_path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%d", &base) == 1 && base >= 0)
+            found = base + offset;
+        fclose(f);
+        if (found >= 0) break;
+    }
+    closedir(d);
+    return found;
+}
+
+static void detect_default_gpio_numbers(void)
+{
+    /* GC9A01 DC/RST are on PWR_GPIO_25 / PWR_GPIO_21 (Duo Pin5 / Pin11). */
+    if (g_pin_dc < 0) {
+        g_pin_dc = gpio_sysfs_number_for("5021000.gpio", 25);
+        if (g_pin_dc < 0)
+            g_pin_dc = gpio_sysfs_number_for("porte", 25);
+    }
+    if (g_pin_rst < 0) {
+        g_pin_rst = gpio_sysfs_number_for("5021000.gpio", 21);
+        if (g_pin_rst < 0)
+            g_pin_rst = gpio_sysfs_number_for("porte", 21);
+    }
+    /* Last-resort fallback to the numbers from older kernels. */
+    if (g_pin_dc < 0) g_pin_dc = 377;
+    if (g_pin_rst < 0) g_pin_rst = 373;
+}
 
 static int env_int(const char *name, int current) {
     const char *value = getenv(name);
@@ -59,6 +118,7 @@ static void load_config_from_env(void) {
     g_pinmux_mosi = env_str("GC9A01_PINMUX_MOSI", g_pinmux_mosi);
     g_pinmux_rst = env_str("GC9A01_PINMUX_RST", g_pinmux_rst);
     g_pinmux_cs = env_str("GC9A01_PINMUX_CS", g_pinmux_cs);
+    detect_default_gpio_numbers();
 }
 
 static void run_pinmux(const char *mux) {
