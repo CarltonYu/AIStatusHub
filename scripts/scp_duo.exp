@@ -1,0 +1,27 @@
+#!/usr/bin/expect -f
+set timeout 60
+set src [lindex $argv 0]
+set dst [lindex $argv 1]
+set pass [lindex $argv 2]
+if {$src == ""} { set src "configure-bt-module.py" }
+if {$dst == ""} { set dst "root@192.168.42.1:/root/configure-bt-module.py" }
+if {$pass == ""} { set pass "milkv" }
+
+spawn scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR $src $dst
+expect {
+    "password:" {
+        send "$pass\r"
+        exp_continue
+    }
+    "Password:" {
+        send "$pass\r"
+        exp_continue
+    }
+    timeout {
+        puts "ERROR: scp timeout"
+        exit 1
+    }
+    eof
+}
+catch wait result
+exit [lindex $result 3]
