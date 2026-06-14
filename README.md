@@ -82,9 +82,13 @@ If AIStatusHub `proxy.api_key` is empty, Hermes must send a Bearer token, for ex
 
 ## Duo Face Output
 
-AIStatusHub can drive the `irisoled-face` daemon running on the Duo board. When
+AIStatusHub can drive the face daemon running on the Duo board over UDP. When
 any local AI task is active, it sends `default angry`; when all local AI tasks
 finish, it sends `normal`.
+
+For the dual-screen setup (ST7789V Linux console + GC9A01 expression screen),
+the image runs `gc9a01-face-daemon`, which listens on UDP port 25250 and drives
+the GC9A01 round LCD via `/dev/spidev0.1`.
 
 ```toml
 [[outputs]]
@@ -96,5 +100,8 @@ busy_expression = "angry"
 idle_expression = "normal"
 include_remote_states = false
 ```
+
+For single-screen setups, the older `irisoled-face` framebuffer daemon is still
+available under `duo/CV1800B/lvgl-framebuffer-gc9a01/irisoled-face/`.
 
 The repository also includes `.vscode/tasks.json` for manual source events.

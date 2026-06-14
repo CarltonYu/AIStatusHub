@@ -4,16 +4,55 @@
 # to the VM's local disk (/home/carlton.guest) and build there.
 #
 # Usage:
+#   ./duo/CV1800B/build_duo_image.sh              # on macOS: auto-runs inside Lima VM
 #   limactl shell duo-builder -- /Users/carlton/Documents/code/self/AIStatusHub/duo/CV1800B/build_duo_image.sh
 # Or run directly inside the VM.
 
-set -e
-
-# Project paths (inside Lima VM)
+# Project paths (used both on macOS and inside Lima VM)
 HOST_PROJ_DIR="/Users/carlton/Documents/code/self/AIStatusHub"
 HOST_SDK_DIR="${HOST_PROJ_DIR}/duo/CV1800B/duo-buildroot-sdk"
+HOST_INSTALL_DIR="${HOST_SDK_DIR}/install/soc_cv1800b_milkv_duo_sd"
 LOCAL_BASE="/home/carlton.guest"
 LOCAL_SDK_DIR="${LOCAL_BASE}/duo-buildroot-sdk"
+LOCAL_INSTALL_DIR="${LOCAL_SDK_DIR}/install/soc_cv1800b_milkv_duo_sd"
+
+# On macOS, run the build inside the Lima VM, then use limactl copy to pull
+# outputs back. Direct cp through the virtiofs/sshfs mount is unreliable for
+# large files, so we avoid it.
+if [ "$(uname -s)" = "Darwin" ]; then
+    LIMA_VM="duo-builder"
+    SCRIPT_IN_LIMA="${HOST_PROJ_DIR}/duo/CV1800B/build_duo_image.sh"
+
+    if ! command -v limactl >/dev/null 2>&1; then
+        echo "错误: 本脚本需要在 Lima VM 内运行，但当前系统未安装 limactl。" >&2
+        echo "请先安装 Lima 并创建 VM: scripts/setup-macos-duo-env.sh" >&2
+        exit 1
+    fi
+
+    if ! limactl list --format '{{.Name}}' 2>/dev/null | grep -qx "${LIMA_VM}"; then
+        echo "错误: Lima VM '${LIMA_VM}' 不存在。" >&2
+        echo "请先执行: scripts/setup-macos-duo-env.sh" >&2
+        exit 1
+    fi
+
+    echo "在 macOS 上检测到，自动进入 Lima VM '${LIMA_VM}' 执行构建..."
+    if ! limactl shell "${LIMA_VM}" -- env SKIP_HOST_COPY=1 "${SCRIPT_IN_LIMA}" "$@"; then
+        echo "错误: Lima VM 内构建失败。" >&2
+        exit 1
+    fi
+
+    echo "构建完成，开始用 limactl copy 复制输出到 macOS..."
+    mkdir -p "${HOST_INSTALL_DIR}"
+    limactl copy "${LIMA_VM}:${LOCAL_INSTALL_DIR}/milkv-duo-sd.img" "${HOST_INSTALL_DIR}/milkv-duo-sd.img"
+    limactl copy "${LIMA_VM}:${LOCAL_INSTALL_DIR}/upgrade.zip" "${HOST_INSTALL_DIR}/upgrade.zip"
+    limactl copy "${LIMA_VM}:${LOCAL_INSTALL_DIR}/fip.bin" "${HOST_INSTALL_DIR}/fip.bin"
+    echo "输出文件已复制到: ${HOST_INSTALL_DIR}"
+    exit 0
+fi
+
+set -e
+
+# Paths inside Lima VM
 LOCAL_LOG_DIR="${LOCAL_BASE}/duo-build-logs"
 LOCAL_BUILD_LOG="${LOCAL_LOG_DIR}/build_duo_image.log"
 LOCAL_RESULT_LOG="${LOCAL_LOG_DIR}/build_duo_image_result.log"
@@ -37,6 +76,51 @@ copy_logs_back() {
     cp -f "${LOCAL_RESULT_LOG}" "${HOST_RESULT_LOG}" 2>/dev/null || true
 }
 trap copy_logs_back EXIT
+
+# Compute MD5 of a file (uses md5sum in Lima, falls back to md5 on macOS).
+file_md5() {
+    local f="$1"
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$f" | awk '{print $1}'
+    elif command -v md5 >/dev/null 2>&1; then
+        md5 "$f" | awk '{print $NF}'
+    else
+        echo "unknown"
+    fi
+}
+
+# Copy a file from VM local disk to host project directory and verify checksum.
+# Falls back to limactl copy if the direct write through the mount is unreliable.
+copy_file_with_verify() {
+    local src="$1"
+    local dst="$2"
+    local src_md5 dst_md5
+
+    if [ ! -f "$src" ]; then
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+    if cp -f -v "$src" "$dst" 2>/dev/null; then
+        src_md5=$(file_md5 "$src")
+        dst_md5=$(file_md5 "$dst")
+        if [ "$src_md5" = "$dst_md5" ] && [ "$src_md5" != "unknown" ]; then
+            return 0
+        fi
+        log "警告: 直接复制后校验和不匹配，尝试 limactl copy..."
+    fi
+
+    if command -v limactl >/dev/null 2>&1; then
+        limactl copy "duo-builder:${src}" "$dst" 2>/dev/null || true
+        src_md5=$(file_md5 "$src")
+        dst_md5=$(file_md5 "$dst")
+        if [ "$src_md5" = "$dst_md5" ] && [ "$src_md5" != "unknown" ]; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
 
 log "========================================="
 log "开始编译定制 Duo Linux 镜像"
@@ -77,6 +161,43 @@ if [ "${SKIP_COPY}" -eq 0 ]; then
 else
     log "使用已存在的本地 SDK: ${LOCAL_SDK_DIR}"
 fi
+
+# 1a. Always sync board overlay files. The SKIP_COPY optimization above skips the
+# full SDK copy when the submodule commit matches, but overlay files (e.g. extra
+# binaries, init scripts) are often changed without bumping the submodule commit.
+# If we don't re-sync them, the final rootfs will use stale overlays.
+log "同步 overlay 文件到本地 SDK..."
+OVERLAY_DIRS=(
+    "device/common/br_overlay"
+    "device/milkv-duo-sd/overlay"
+)
+
+# Remove stale files that have been renamed/removed in the host SDK but may
+# still be present in the VM's cached buildroot target/rootfs. Buildroot's
+# overlay application does not always delete removed files.
+STALE_FILES=(
+    "${LOCAL_SDK_DIR}/device/common/br_overlay/etc/init.d/S99gc9a01-face"
+    "${BR_OUTPUT_LOCAL}/milkv-duo-sd_musl_riscv64/target/etc/init.d/S99gc9a01-face"
+    "${BR_ROOTFS_LOCAL}/etc/init.d/S99gc9a01-face"
+)
+for p in "${STALE_FILES[@]}"; do
+    [ -f "$p" ] && { rm -f "$p"; log "移除陈旧文件: $p"; }
+done
+
+for rel in "${OVERLAY_DIRS[@]}"; do
+    host_dir="${HOST_SDK_DIR}/${rel}"
+    local_dir="${LOCAL_SDK_DIR}/${rel}"
+    if [ -d "${host_dir}" ]; then
+        mkdir -p "${local_dir}"
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete "${host_dir}/" "${local_dir}/"
+        else
+            rm -rf "${local_dir}"
+            cp -a "${host_dir}" "${local_dir}"
+        fi
+        log "  已同步 ${rel}"
+    fi
+done
 
 cd "${LOCAL_SDK_DIR}"
 
@@ -182,7 +303,6 @@ fi
 
 # 11. Copy output image back to host project directory
 INSTALL_DIR="${LOCAL_SDK_DIR}/install/soc_cv1800b_milkv_duo_sd"
-HOST_INSTALL_DIR="${HOST_SDK_DIR}/install/soc_cv1800b_milkv_duo_sd"
 
 log "========================================="
 log "编译打包完成，检查输出文件:"
@@ -195,21 +315,34 @@ done
 
 if [ -n "${IMG_FILE}" ]; then
     log "SD 镜像: ${IMG_FILE}"
-    # Try to copy important outputs back to host project directory.
-    # This may fail if the project directory is mounted read-only inside Lima.
-    if mkdir -p "${HOST_INSTALL_DIR}" 2>/dev/null; then
-        cp -v "${INSTALL_DIR}"/*.img "${HOST_INSTALL_DIR}/" 2>/dev/null || true
-        cp -v "${INSTALL_DIR}"/*.zip "${HOST_INSTALL_DIR}/" 2>/dev/null || true
-        cp -v "${INSTALL_DIR}/fip.bin" "${HOST_INSTALL_DIR}/" 2>/dev/null || true
-        cp -v "${INSTALL_DIR}/rootfs.tar.xz" "${HOST_INSTALL_DIR}/" 2>/dev/null || true
-        cp -r "${INSTALL_DIR}/rawimages" "${HOST_INSTALL_DIR}/" 2>/dev/null || true
-        log "输出文件已复制到: ${HOST_INSTALL_DIR}"
-        HOST_IMG="${HOST_INSTALL_DIR}/$(basename "${IMG_FILE}")"
+
+    if [ "${SKIP_HOST_COPY:-0}" = "1" ]; then
+        # macOS wrapper will pull outputs with limactl copy after the VM build finishes.
+        log "跳过宿主机复制（由 macOS 外层脚本通过 limactl copy 处理）。"
     else
-        log "宿主机目录在 VM 内只读，无法直接复制。"
-        log "请在 macOS 宿主机上手动复制:"
-        log "  limactl copy duo-builder:${IMG_FILE} ${HOST_INSTALL_DIR}/$(basename "${IMG_FILE}")"
+        # Copy important outputs back to host project directory.
+        # Direct cp through the virtiofs/sshfs mount can silently produce stale files,
+        # so we verify checksums and fall back to limactl copy when necessary.
+        mkdir -p "${HOST_INSTALL_DIR}" 2>/dev/null || true
+
         HOST_IMG="${HOST_INSTALL_DIR}/$(basename "${IMG_FILE}")"
+        if copy_file_with_verify "${IMG_FILE}" "${HOST_IMG}"; then
+            log "SD 镜像已复制并校验通过: ${HOST_IMG}"
+        else
+            log "警告: SD 镜像复制到宿主机可能未成功。"
+            log "请在 macOS 宿主机上手动复制:"
+            log "  limactl copy duo-builder:${IMG_FILE} ${HOST_IMG}"
+        fi
+
+        # Copy other outputs (best-effort; verify when possible).
+        for f in "${INSTALL_DIR}"/*.zip "${INSTALL_DIR}/fip.bin" "${INSTALL_DIR}/rootfs.tar.xz"; do
+            if [ -f "$f" ]; then
+                copy_file_with_verify "$f" "${HOST_INSTALL_DIR}/$(basename "$f")" || true
+            fi
+        done
+        # rawimages is a directory of intermediate files; skip if host dir is read-only.
+        cp -r "${INSTALL_DIR}/rawimages" "${HOST_INSTALL_DIR}/" 2>/dev/null || true
+        log "输出目录: ${HOST_INSTALL_DIR}"
     fi
 
     log "在 macOS 上可用以下命令烧录到 SD 卡:"

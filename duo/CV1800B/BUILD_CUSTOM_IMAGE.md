@@ -87,4 +87,8 @@ sync
 
 3. **mailbox 保留**：`CONFIG_CVI_MAILBOX=y` 已保留，大小核通信功能正常。
 
-4. **SPI 屏幕**：本镜像默认支持 `spidev` 和 `gpio sysfs`。GC9A01 屏幕通过用户态程序（如 `c-gc9a01/gc9a01-demo`）控制，不依赖内核显示驱动。
+4. **SPI 屏幕**：
+   - ST7789V 240×320 屏注册为 `/dev/fb0`，开机显示 Linux 控制台（fbcon/getty）。
+   - GC9A01 240×240 圆形表情屏由 `/dev/spidev0.1` 用户态驱动，开机自动启动 `gc9a01-face-daemon`。
+   - `gc9a01-face-daemon` 监听 UDP 25250，支持 `default <expr>` / `normal` / `play <expr>` 等命令，与 AIStatusHub 的 `irisoled-udp` 输出协议兼容。
+   - 源码与构建脚本位于 `duo/CV1800B/gc9a01-face-daemon/`。
