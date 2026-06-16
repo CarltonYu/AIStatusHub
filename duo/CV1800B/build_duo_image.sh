@@ -199,6 +199,39 @@ for rel in "${OVERLAY_DIRS[@]}"; do
     fi
 done
 
+# 1b. Sync source files that affect the kernel / u-boot configuration. The
+# SKIP_COPY optimization skips the full SDK copy when the submodule commit
+# matches, so these files must be kept in sync explicitly. When they change,
+# the corresponding build directory must be cleaned or the SDK will reuse stale
+# artifacts and silently ignore the new defconfig / bootargs.
+log "同步内核 / u-boot 关键源码文件..."
+NEED_CLEAN_KERNEL=0
+NEED_CLEAN_UBOOT=0
+
+sync_source_file() {
+    local rel="$1"
+    local host_f="${HOST_SDK_DIR}/${rel}"
+    local local_f="${LOCAL_SDK_DIR}/${rel}"
+    if [ ! -f "${host_f}" ]; then
+        log "  警告: 宿主机文件不存在: ${rel}"
+        return 1
+    fi
+    mkdir -p "$(dirname "${local_f}")"
+    if [ ! -f "${local_f}" ] || ! diff -q "${host_f}" "${local_f}" >/dev/null 2>&1; then
+        cp -f "${host_f}" "${local_f}"
+        log "  已同步 ${rel}"
+        return 0
+    fi
+    return 1
+}
+
+if sync_source_file "build/boards/cv180x/cv1800b_milkv_duo_sd/linux/cvitek_cv1800b_milkv_duo_sd_defconfig"; then
+    NEED_CLEAN_KERNEL=1
+fi
+if sync_source_file "u-boot-2021.10/include/configs/cv180x-asic.h"; then
+    NEED_CLEAN_UBOOT=1
+fi
+
 cd "${LOCAL_SDK_DIR}"
 
 # 3. Verify submodule commit matches parent tracking
@@ -241,6 +274,18 @@ source build/envsetup_milkv.sh list
 log "选择板级配置: milkv-duo-sd"
 check_board milkv-duo-sd
 build_info
+
+# 7a. Clean stale build artifacts when kernel / u-boot source config changed.
+# build_all reuses existing build directories, so a clean is required for the
+# updated defconfig / bootargs to take effect.
+if [ "${NEED_CLEAN_KERNEL}" -eq 1 ]; then
+    log "内核 defconfig 已更新，执行 clean_kernel..."
+    clean_kernel || { log "警告: clean_kernel 失败，继续尝试构建"; }
+fi
+if [ "${NEED_CLEAN_UBOOT}" -eq 1 ]; then
+    log "u-boot 头文件已更新，执行 clean_uboot..."
+    clean_uboot || { log "警告: clean_uboot 失败，继续尝试构建"; }
+fi
 
 # 8. Patch middleware sample build for no-camera / no-ION image
 #    Camera/ISP/video samples reference symbols unavailable when ION is disabled.

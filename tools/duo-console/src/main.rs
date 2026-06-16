@@ -51,7 +51,7 @@ fn main() -> io::Result<()> {
 
     if atty::is(atty::Stream::Stdin) {
         println!("duo-console: sending to {}. Type commands and press Enter.", addr);
-        println!("Examples: string hello   /   cmd enter   /   combo ctrl+c");
+        println!("Examples: echo hello   /   cmd enter   /   combo ctrl+c");
         print!("> ");
         stdout.flush()?;
     }

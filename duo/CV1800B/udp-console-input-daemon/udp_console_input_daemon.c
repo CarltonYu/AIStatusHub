@@ -5,7 +5,7 @@
  * using TIOCSTI, so commands appear on the ST7789V framebuffer console (tty1).
  *
  * Supported commands (one per UDP packet/line):
- *   string <text>      Type literal text
+ *   echo <text>        Type literal text (like a shell echo)
  *   cmd <key>          Press a special key: enter, tab, backspace, escape,
  *                      up, down, left, right, home, end, pgup, pgdown
  *   combo <mod>+<key>  Modifier combo: ctrl+c, ctrl+d, ctrl+l, alt+f4, etc.
@@ -156,8 +156,8 @@ static void process_line(const char *line) {
     while (*line == ' ' || *line == '\t') line++;
     if (line[0] == '\0') return;
 
-    if (strncmp(line, "string ", 7) == 0) {
-        inject_string(line + 7);
+    if (strncmp(line, "echo ", 5) == 0) {
+        inject_string(line + 5);
     } else if (strncmp(line, "cmd ", 4) == 0) {
         handle_cmd(line + 4);
     } else if (strncmp(line, "combo ", 6) == 0) {

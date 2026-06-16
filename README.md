@@ -124,14 +124,14 @@ echo "combo ctrl+c"  | nc -u -w 0 192.168.42.1 25251
 echo "combo alt+tab" | nc -u -w 0 192.168.42.1 25251
 ```
 
-The console font is set to `fbcon=font:8x8` for the 320×240 ST7789V screen.
+The console font is set to `fbcon=font:6x8` for the 240×320 ST7789V screen.
 
 A cross-host helper `duo-console` is provided in `tools/duo-console/`. After
 installation you can type commands directly instead of piping through `nc`:
 
 ```bash
 # One-shot
-duo-console "string hello"
+duo-console "echo hello"
 duo-console "cmd enter"
 duo-console "combo ctrl+c"
 

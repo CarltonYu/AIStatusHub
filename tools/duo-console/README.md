@@ -19,7 +19,7 @@ export PATH=$HOME/.local/bin:$PATH
 Open a new terminal tab/window and try:
 
 ```bash
-duo-console "string hello"
+duo-console "echo hello"
 duo-console "cmd enter"
 duo-console "combo ctrl+c"
 ```
@@ -43,8 +43,8 @@ Run without arguments and type commands followed by Enter:
 ```bash
 $ duo-console
 duo-console: sending to 192.168.42.1:25251. Type commands and press Enter.
-Examples: string hello   /   cmd enter   /   combo ctrl+c
-> string hello
+Examples: echo hello   /   cmd enter   /   combo ctrl+c
+> echo hello
 > cmd enter
 > combo ctrl+c
 > ^D
@@ -71,7 +71,7 @@ These are the same commands accepted by `udp-console-input-daemon`:
 
 | Command | Example | Meaning |
 |---|---|---|
-| `string <text>` | `string hello` | Type text into Duo console |
+| `echo <text>` | `echo hello` | Type text into Duo console |
 | `cmd <key>` | `cmd enter` | Press a special key |
 | `combo <mod>+<key>` | `combo ctrl+c` | Press a modifier combo |
 
