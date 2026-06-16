@@ -1,0 +1,16 @@
+[package]
+name = "duo-console"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-host CLI to inject keystrokes into a Milk-V Duo local console over UDP."
+
+[dependencies]
+atty = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = true

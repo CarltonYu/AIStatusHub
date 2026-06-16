@@ -104,4 +104,44 @@ include_remote_states = false
 For single-screen setups, the older `irisoled-face` framebuffer daemon is still
 available under `duo/CV1800B/lvgl-framebuffer-gc9a01/irisoled-face/`.
 
+## Duo Console Input Output
+
+For setups where the Duo has its own display (e.g. ST7789V framebuffer console),
+the image runs `udp-console-input-daemon`. It listens on UDP port **25251** and
+injects received text/keystrokes into the local Linux TTY (`/dev/tty1`) using
+`TIOCSTI`, so commands appear directly on the Duo screen's command line.
+
+```bash
+# Type text (use -w 0 so nc exits immediately on macOS)
+echo "string hello world" | nc -u -w 0 192.168.42.1 25251
+
+# Special keys
+echo "cmd enter"  | nc -u -w 0 192.168.42.1 25251
+echo "cmd left"   | nc -u -w 0 192.168.42.1 25251
+
+# Modifier combinations
+echo "combo ctrl+c"  | nc -u -w 0 192.168.42.1 25251
+echo "combo alt+tab" | nc -u -w 0 192.168.42.1 25251
+```
+
+The console font is set to `fbcon=font:8x8` for the 320×240 ST7789V screen.
+
+A cross-host helper `duo-console` is provided in `tools/duo-console/`. After
+installation you can type commands directly instead of piping through `nc`:
+
+```bash
+# One-shot
+duo-console "string hello"
+duo-console "cmd enter"
+duo-console "combo ctrl+c"
+
+# Interactive REPL
+duo-console
+> string hello
+> cmd enter
+```
+
+See `duo/CV1800B/udp-console-input-daemon/README.md` for the full command list
+and `tools/duo-console/README.md` for install/build instructions.
+
 The repository also includes `.vscode/tasks.json` for manual source events.
