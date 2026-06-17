@@ -4,15 +4,42 @@ Cross-platform CLI tool for sending text/keystrokes to a Milk-V Duo local
 console over UDP. It talks to `udp-console-input-daemon` (port `25251` by
 default).
 
-## Install on this Mac
+## Install on Windows
 
-Rust and the `duo-console` binary have already been set up:
+From the repository root:
+
+```powershell
+.\install-duo-console.bat
+```
+
+The installer builds `tools\duo-console` in release mode, copies
+`duo-console.exe` to `%USERPROFILE%\.local\bin`, and adds that directory to the
+current user's `Path` environment variable. Open a new terminal after install,
+then try:
+
+```powershell
+duo-console "echo hello"
+duo-console "cmd enter"
+duo-console "combo ctrl+c"
+```
+
+Advanced options:
+
+```powershell
+.\scripts\install-duo-console-command.ps1 -InstallDir C:\tools\bin
+.\scripts\install-duo-console-command.ps1 -NoBuild
+.\scripts\install-duo-console-command.ps1 -NoPathUpdate
+```
+
+## Install on macOS / Linux
+
+Build the binary, copy it to a directory on your `PATH`, then open a new shell:
 
 ```bash
-# Binary location
-ls ~/.local/bin/duo-console
-
-# Make sure ~/.local/bin is in your PATH (already added to ~/.zshrc)
+cd tools/duo-console
+cargo build --release
+mkdir -p ~/.local/bin
+cp target/release/duo-console ~/.local/bin/
 export PATH=$HOME/.local/bin:$PATH
 ```
 
@@ -123,7 +150,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 For other targets, run `rustup target list` and add the desired triple.
 
-## Adding to PATH
+## Adding to PATH Manually
 
 Copy the built binary to a directory on your PATH, for example:
 

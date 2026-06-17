@@ -1,0 +1,39 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "aistatushub-mimo": {
+      "name": "AIStatusHub MiMo",
+      "npm": "@ai-sdk/openai-compatible",
+      "api": "http://127.0.0.1:17888/mimo/v1",
+      "options": {
+        "apiKey": "anonymous"
+      },
+      "models": {
+        "mimo-auto": {
+          "name": "MiMo Auto via AIStatusHub",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    }
+  }
+}

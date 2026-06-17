@@ -27,12 +27,16 @@ enabled = false
 source = "hermes-agent"
 anthropic_source = "vscode-claude-code"
 kimi_source = "vscode-kimi-code"
+mimo_source = "mimo-code"
 source_header = "x-aistatushub-source"
 upstream_base_url_header = "x-aistatushub-upstream-base-url"
 upstream_base_url = "https://api.example.com/v1"
 anthropic_upstream_base_url = "https://api.anthropic.com"
 kimi_upstream_base_url = "https://api.kimi.com/coding/v1"
+mimo_upstream_base_url = "https://api.xiaomimimo.com/api/free-ai/openai"
 api_key = ""
+mimo_api_key = ""
+mimo_upstream_model = "mimo-v2.5-pro"
 timeout_secs = 120
 
 [monitors.codex_local]
@@ -64,6 +68,8 @@ enabled = false
 url = "udp://192.168.42.1:25250"
 busy_expression = "angry"
 idle_expression = "normal"
+busy_state_ttl_ms = 0
+refresh_interval_ms = 30000
 include_remote_states = false
 
 [[outputs]]

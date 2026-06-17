@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{env, fs, path::PathBuf, sync::Arc};
 
 use axum::{
     body::{Body, Bytes},
@@ -64,9 +64,21 @@ struct HubSnapshotRequest {
     items: Vec<HubStateEnvelope>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MimoFreeBootstrapResponse {
+    jwt: String,
+}
+
+#[derive(Clone, Copy)]
+enum ProxyAuthMode {
+    Standard,
+    Mimo,
+}
+
 const OPENAI_PROXY_SURFACE: &str = "openai-compatible-proxy";
 const ANTHROPIC_PROXY_SURFACE: &str = "anthropic-compatible-proxy";
 const KIMI_PROXY_SURFACE: &str = "kimi-openai-compatible-proxy";
+const MIMO_PROXY_SURFACE: &str = "mimo-openai-compatible-proxy";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -83,9 +95,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/hub/snapshot", post(hub_snapshot))
         .route("/anthropic/v1/messages", post(proxy_anthropic_messages))
         .route("/anthropic/*proxy_path", any(proxy_anthropic_path))
-        .route("/kimi/v1/chat/completions", post(proxy_kimi_chat_completions))
+        .route(
+            "/kimi/v1/chat/completions",
+            post(proxy_kimi_chat_completions),
+        )
         .route("/kimi/v1/models", get(proxy_kimi_models))
         .route("/kimi/v1/*proxy_path", any(proxy_kimi_v1_path))
+        .route(
+            "/mimo/v1/chat/completions",
+            post(proxy_mimo_chat_completions),
+        )
+        .route("/mimo/v1/models", get(proxy_mimo_models))
+        .route("/mimo/v1/*proxy_path", any(proxy_mimo_v1_path))
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .route("/v1/models", get(proxy_models))
         .route("/v1/*proxy_path", any(proxy_v1_path))
@@ -327,7 +348,7 @@ async fn proxy_chat_completions(
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let mut request = client.post(upstream_url).json(&payload);
-    request = apply_proxy_headers(request, &headers, &state);
+    request = apply_openai_proxy_headers(request, &headers, &state, &upstream_base_url);
 
     let upstream = match request.send().await {
         Ok(response) => response,
@@ -714,6 +735,41 @@ async fn proxy_kimi_chat_completions(
         source,
         KIMI_PROXY_SURFACE,
         "Kimi proxy",
+        "chat/completions",
+        ProxyAuthMode::Standard,
+    )
+    .await
+}
+
+async fn proxy_mimo_chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Mimo proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_mimo_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy mimo_upstream_base_url is not configured",
+        );
+    };
+
+    let payload = proxy_mimo_chat_payload(&state, &upstream_base_url, payload);
+    let source = proxy_mimo_source(&state);
+    let chat_path = mimo_openai_chat_path(&upstream_base_url);
+    proxy_openai_chat_request(
+        state,
+        headers,
+        payload,
+        upstream_base_url,
+        source,
+        MIMO_PROXY_SURFACE,
+        "Mimo proxy",
+        chat_path,
+        ProxyAuthMode::Mimo,
     )
     .await
 }
@@ -726,6 +782,8 @@ async fn proxy_openai_chat_request(
     source: String,
     surface: &'static str,
     label: &'static str,
+    chat_path: &'static str,
+    auth_mode: ProxyAuthMode,
 ) -> Response {
     let model = payload
         .get("model")
@@ -788,10 +846,7 @@ async fn proxy_openai_chat_request(
         .await;
     }
 
-    let upstream_url = format!(
-        "{}/chat/completions",
-        upstream_base_url.trim_end_matches('/')
-    );
+    let upstream_url = format!("{}/{}", upstream_base_url.trim_end_matches('/'), chat_path);
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
         .build()
@@ -800,7 +855,32 @@ async fn proxy_openai_chat_request(
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let mut request = client.post(upstream_url).json(&payload);
-    request = apply_proxy_headers(request, &headers, &state);
+    request = match apply_proxy_headers_with_auth(
+        request,
+        &headers,
+        &state,
+        &client,
+        &upstream_base_url,
+        auth_mode,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = proxy_finish_event(
+                &state,
+                surface,
+                &source,
+                &session_id,
+                model,
+                Status::Error,
+                format!("{label} request failed: {error}"),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return json_error(StatusCode::BAD_GATEWAY, &error);
+        }
+    };
 
     let upstream = match request.send().await {
         Ok(response) => response,
@@ -951,7 +1031,7 @@ async fn proxy_models(State(state): State<AppState>, headers: HeaderMap) -> Resp
         "{}/models",
         upstream_base_url.trim_end_matches('/')
     ));
-    request = apply_proxy_headers(request, &headers, &state);
+    request = apply_openai_proxy_headers(request, &headers, &state, &upstream_base_url);
 
     match request.send().await {
         Ok(response) => {
@@ -999,7 +1079,82 @@ async fn proxy_kimi_models(State(state): State<AppState>, headers: HeaderMap) ->
         "{}/models",
         upstream_base_url.trim_end_matches('/')
     ));
-    request = apply_proxy_headers(request, &headers, &state);
+    request = apply_openai_proxy_headers(request, &headers, &state, &upstream_base_url);
+
+    match request.send().await {
+        Ok(response) => {
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+            };
+            let mut builder = Response::builder().status(status);
+            if let Some(content_type) = content_type {
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    builder = builder.header(header::CONTENT_TYPE, value);
+                }
+            }
+            builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to build proxy response",
+                )
+            })
+        }
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn proxy_mimo_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Mimo proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_mimo_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy mimo_upstream_base_url is not configured",
+        );
+    };
+    if is_mimo_free_upstream(&upstream_base_url) {
+        return Json(json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "mimo-auto",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "mimo"
+                }
+            ]
+        }))
+        .into_response();
+    }
+
+    let client = reqwest::Client::new();
+    let mut request = client.get(format!(
+        "{}/models",
+        upstream_base_url.trim_end_matches('/')
+    ));
+    request = match apply_proxy_headers_with_auth(
+        request,
+        &headers,
+        &state,
+        &client,
+        &upstream_base_url,
+        ProxyAuthMode::Mimo,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error),
+    };
 
     match request.send().await {
         Ok(response) => {
@@ -1078,7 +1233,7 @@ async fn proxy_v1_path(
     };
 
     let mut request = client.request(reqwest_method, upstream_url);
-    request = apply_proxy_headers(request, &headers, &state);
+    request = apply_openai_proxy_headers(request, &headers, &state, &upstream_base_url);
     if !body.is_empty() {
         request = request.body(body);
     }
@@ -1137,6 +1292,83 @@ async fn proxy_kimi_v1_path(
 
     let mut request = client.request(reqwest_method, upstream_url);
     request = apply_proxy_headers(request, &headers, &state);
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    match request.send().await {
+        Ok(response) => proxy_response(response, false).await,
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn proxy_mimo_v1_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    Path(proxy_path): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !state.config.proxy.enabled {
+        return json_error(StatusCode::NOT_FOUND, "Mimo proxy is disabled");
+    }
+
+    let Some(upstream_base_url) = proxy_mimo_upstream_base_url(&state) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "proxy mimo_upstream_base_url is not configured",
+        );
+    };
+
+    let clean_path = proxy_path.trim_start_matches('/');
+    if clean_path.is_empty() || clean_path.contains("..") {
+        return json_error(StatusCode::BAD_REQUEST, "invalid proxy path");
+    }
+    let clean_path = if is_mimo_free_upstream(&upstream_base_url)
+        && clean_path.eq_ignore_ascii_case("chat/completions")
+    {
+        "chat"
+    } else {
+        clean_path
+    };
+
+    let query = uri
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    let upstream_url = format!(
+        "{}/{}{}",
+        upstream_base_url.trim_end_matches('/'),
+        clean_path,
+        query
+    );
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(state.config.proxy.timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+
+    let mut request = client.request(reqwest_method, upstream_url);
+    request = match apply_proxy_headers_with_auth(
+        request,
+        &headers,
+        &state,
+        &client,
+        &upstream_base_url,
+        ProxyAuthMode::Mimo,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error),
+    };
     if !body.is_empty() {
         request = request.body(body);
     }
@@ -1427,6 +1659,52 @@ fn apply_proxy_headers(
     headers: &HeaderMap,
     state: &AppState,
 ) -> reqwest::RequestBuilder {
+    request = apply_forwarded_proxy_headers(request, headers, state);
+    apply_standard_proxy_auth(request, headers, state)
+}
+
+fn apply_openai_proxy_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    state: &AppState,
+    upstream_base_url: &str,
+) -> reqwest::RequestBuilder {
+    request = apply_forwarded_proxy_headers(request, headers, state);
+    if is_mimo_upstream(upstream_base_url) {
+        if let Some(api_key) = configured_proxy_mimo_api_key(state) {
+            return request.bearer_auth(api_key).header("X-Mimo-Source", "hermes-agent");
+        }
+    }
+
+    apply_standard_proxy_auth(request, headers, state)
+}
+
+async fn apply_proxy_headers_with_auth(
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    state: &AppState,
+    client: &reqwest::Client,
+    upstream_base_url: &str,
+    auth_mode: ProxyAuthMode,
+) -> Result<reqwest::RequestBuilder, String> {
+    let request = apply_forwarded_proxy_headers(request, headers, state);
+    match auth_mode {
+        ProxyAuthMode::Standard => Ok(apply_standard_proxy_auth(request, headers, state)),
+        ProxyAuthMode::Mimo if is_mimo_free_upstream(upstream_base_url) => {
+            let jwt = mimo_free_jwt(client, upstream_base_url).await?;
+            Ok(request
+                .bearer_auth(jwt)
+                .header("X-Mimo-Source", "mimocode-cli-free"))
+        }
+        ProxyAuthMode::Mimo => Ok(apply_mimo_proxy_auth(request, headers, state)),
+    }
+}
+
+fn apply_forwarded_proxy_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> reqwest::RequestBuilder {
     for (name, value) in headers.iter() {
         if !should_forward_proxy_header(name.as_str(), state) {
             continue;
@@ -1442,6 +1720,14 @@ fn apply_proxy_headers(
         request = request.header(header_name, header_value);
     }
 
+    request
+}
+
+fn apply_standard_proxy_auth(
+    mut request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> reqwest::RequestBuilder {
     if let Some(api_key) = configured_proxy_api_key(state) {
         request = request.bearer_auth(api_key);
     } else if let Some(auth) = headers
@@ -1452,6 +1738,151 @@ fn apply_proxy_headers(
     }
 
     request
+}
+
+fn apply_mimo_proxy_auth(
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> reqwest::RequestBuilder {
+    if let Some(api_key) = configured_proxy_mimo_api_key(state) {
+        request
+            .bearer_auth(api_key)
+            .header("X-Mimo-Source", "mimocode-cli")
+    } else {
+        apply_standard_proxy_auth(request, headers, state)
+    }
+}
+
+fn proxy_mimo_chat_payload(
+    state: &AppState,
+    upstream_base_url: &str,
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    if is_mimo_free_upstream(upstream_base_url) {
+        return payload;
+    }
+
+    let Some(model) = payload.get("model").and_then(|value| value.as_str()) else {
+        return payload;
+    };
+    if model != "mimo-auto" {
+        return payload;
+    }
+    let Some(upstream_model) = configured_proxy_mimo_upstream_model(state) else {
+        return payload;
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("model".to_string(), json!(upstream_model));
+    }
+
+    payload
+}
+
+async fn mimo_free_jwt(
+    client: &reqwest::Client,
+    upstream_base_url: &str,
+) -> Result<String, String> {
+    let client_id = mimo_free_client_id()?;
+    let bootstrap_url = mimo_free_bootstrap_url(upstream_base_url)
+        .ok_or_else(|| "Mimo free bootstrap URL is not available".to_string())?;
+    let response = client
+        .post(bootstrap_url)
+        .json(&json!({ "client": client_id }))
+        .send()
+        .await
+        .map_err(|error| format!("Mimo free bootstrap failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let body = body.chars().take(200).collect::<String>();
+        return Err(format!(
+            "Mimo free bootstrap returned HTTP {status}: {body}"
+        ));
+    }
+
+    let payload = response
+        .json::<MimoFreeBootstrapResponse>()
+        .await
+        .map_err(|error| format!("Mimo free bootstrap response parse failed: {error}"))?;
+    let jwt = payload.jwt.trim();
+    if jwt.is_empty() {
+        return Err("Mimo free bootstrap response missing jwt".to_string());
+    }
+
+    Ok(jwt.to_string())
+}
+
+fn mimo_free_client_id() -> Result<String, String> {
+    if let Ok(value) = env::var("MIMO_FREE_CLIENT") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+
+    let mut paths = Vec::new();
+    if let Ok(path) = env::var("MIMO_FREE_CLIENT_PATH") {
+        paths.push(PathBuf::from(path));
+    }
+    if let Ok(profile) = env::var("USERPROFILE") {
+        paths.push(
+            PathBuf::from(profile)
+                .join(".local")
+                .join("share")
+                .join("mimocode")
+                .join("mimo-free-client"),
+        );
+    }
+    if let Ok(home) = env::var("HOME") {
+        paths.push(
+            PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("mimocode")
+                .join("mimo-free-client"),
+        );
+    }
+
+    for path in paths {
+        let Ok(value) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+
+    Err(
+        "Mimo free client fingerprint not found; run mimo once or set MIMO_FREE_CLIENT_PATH"
+            .to_string(),
+    )
+}
+
+fn mimo_free_bootstrap_url(upstream_base_url: &str) -> Option<String> {
+    let base = upstream_base_url.trim().trim_end_matches('/');
+    base.strip_suffix("/api/free-ai/openai")
+        .map(|root| format!("{root}/api/free-ai/bootstrap"))
+}
+
+fn is_mimo_free_upstream(upstream_base_url: &str) -> bool {
+    mimo_free_bootstrap_url(upstream_base_url).is_some()
+}
+
+fn is_mimo_upstream(upstream_base_url: &str) -> bool {
+    reqwest::Url::parse(upstream_base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| host.ends_with("xiaomimimo.com"))
+}
+
+fn mimo_openai_chat_path(upstream_base_url: &str) -> &'static str {
+    if is_mimo_free_upstream(upstream_base_url) {
+        "chat"
+    } else {
+        "chat/completions"
+    }
 }
 
 fn should_forward_proxy_header(name: &str, state: &AppState) -> bool {
@@ -1527,6 +1958,20 @@ fn proxy_kimi_upstream_base_url(state: &AppState) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn proxy_mimo_upstream_base_url(state: &AppState) -> Option<String> {
+    state
+        .config
+        .proxy
+        .mimo_upstream_base_url
+        .as_deref()
+        .or(state.config.proxy.upstream_base_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| is_valid_upstream_base_url(value))
+        .map(ToOwned::to_owned)
+}
+
 fn anthropic_upstream_url(base_url: &str, path: &str, query: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let clean_path = path.trim_start_matches('/');
@@ -1579,6 +2024,15 @@ fn proxy_kimi_source(state: &AppState) -> String {
     }
 }
 
+fn proxy_mimo_source(state: &AppState) -> String {
+    let value = state.config.proxy.mimo_source.trim();
+    if is_valid_source_label(value) {
+        value.to_string()
+    } else {
+        "mimo-code".to_string()
+    }
+}
+
 fn is_valid_source_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -1594,6 +2048,35 @@ fn configured_proxy_api_key(state: &AppState) -> Option<&str> {
         .api_key
         .as_deref()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn configured_proxy_mimo_api_key(state: &AppState) -> Option<String> {
+    env::var("XIAOMI_API_KEY")
+        .ok()
+        .or_else(|| env::var("MIMO_API_KEY").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            state
+                .config
+                .proxy
+                .mimo_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn configured_proxy_mimo_upstream_model(state: &AppState) -> Option<String> {
+    state
+        .config
+        .proxy
+        .mimo_upstream_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn merge_one_remote_state(

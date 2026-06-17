@@ -1,6 +1,11 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use serde_json::json;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::net::UdpSocket;
 
 use crate::{
@@ -10,7 +15,13 @@ use crate::{
 
 #[derive(Debug, Default)]
 pub struct OutputRuntime {
-    device_modes: Mutex<HashMap<String, String>>,
+    device_modes: Mutex<HashMap<String, DeviceModeState>>,
+}
+
+#[derive(Debug, Clone)]
+struct DeviceModeState {
+    mode: String,
+    sent_at: Instant,
 }
 
 impl OutputRuntime {
@@ -56,18 +67,23 @@ pub async fn reconcile_device_outputs(
             continue;
         }
 
+        let now = OffsetDateTime::now_utc();
         let busy = states
             .iter()
             .filter(|state| output.include_remote_states || state.locality == Locality::Local)
-            .any(|state| is_busy_status(&state.status));
+            .any(|state| is_active_busy_state(state, output.busy_state_ttl_ms, now));
         let desired_mode = if busy { "busy" } else { "idle" };
+        let refresh_interval = Duration::from_millis(output.refresh_interval_ms);
+        let send_started_at = Instant::now();
 
         {
-            let modes = runtime.device_modes.lock().unwrap_or_else(|err| err.into_inner());
-            if modes
-                .get(&output.id)
-                .is_some_and(|previous| previous == desired_mode)
-            {
+            let modes = runtime
+                .device_modes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if modes.get(&output.id).is_some_and(|previous| {
+                previous.mode == desired_mode && previous.sent_at.elapsed() < refresh_interval
+            }) {
                 continue;
             }
         }
@@ -78,7 +94,13 @@ pub async fn reconcile_device_outputs(
                     .device_modes
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
-                    .insert(output.id.clone(), desired_mode.to_string());
+                    .insert(
+                        output.id.clone(),
+                        DeviceModeState {
+                            mode: desired_mode.to_string(),
+                            sent_at: send_started_at,
+                        },
+                    );
             }
             Err(error) => {
                 tracing::warn!(
@@ -134,6 +156,25 @@ fn is_busy_status(status: &Status) -> bool {
     )
 }
 
+fn is_active_busy_state(state: &TaskState, busy_state_ttl_ms: u64, now: OffsetDateTime) -> bool {
+    if !is_busy_status(&state.status) {
+        return false;
+    }
+    if busy_state_ttl_ms == 0 {
+        return true;
+    }
+
+    let Ok(updated_at) = OffsetDateTime::parse(&state.updated_at, &Rfc3339) else {
+        return true;
+    };
+    if updated_at > now {
+        return true;
+    }
+
+    let ttl_ms = busy_state_ttl_ms.min(i64::MAX as u64) as i64;
+    now - updated_at <= time::Duration::milliseconds(ttl_ms)
+}
+
 async fn send_irisoled_udp(output: &OutputConfig, mode: &str) -> std::io::Result<()> {
     let Some(target) = irisoled_target(output) else {
         return Err(std::io::Error::new(
@@ -169,13 +210,11 @@ fn irisoled_target(output: &OutputConfig) -> Option<String> {
 fn irisoled_command(output: &OutputConfig, mode: &str) -> String {
     match mode {
         "busy" => {
-            let expression =
-                expression_name(output.busy_expression.as_deref(), "angry");
+            let expression = expression_name(output.busy_expression.as_deref(), "angry");
             format!("default {expression}")
         }
         _ => {
-            let expression =
-                expression_name(output.idle_expression.as_deref(), "normal");
+            let expression = expression_name(output.idle_expression.as_deref(), "normal");
             if expression == "normal" {
                 "normal".to_string()
             } else {

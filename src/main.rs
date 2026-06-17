@@ -61,11 +61,6 @@ async fn run() -> anyhow::Result<()> {
         format!("failed to bind AIStatusHub on {addr}; another instance may already be running")
     })?;
 
-    {
-        let states = app_state.store.all_states().await;
-        outputs::reconcile_device_outputs(&app_state.config, &states, &app_state.outputs).await;
-    }
-
     tracing::info!(
         hub_id = %app_state.config.hub.hub_id,
         address = %addr,

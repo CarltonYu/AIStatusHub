@@ -140,6 +140,10 @@ pub struct OutputConfig {
     pub url: Option<String>,
     pub busy_expression: Option<String>,
     pub idle_expression: Option<String>,
+    #[serde(default = "default_output_busy_state_ttl_ms")]
+    pub busy_state_ttl_ms: u64,
+    #[serde(default = "default_output_refresh_interval_ms")]
+    pub refresh_interval_ms: u64,
     pub target_hub_id: Option<String>,
     pub token: Option<String>,
     pub format: Option<String>,
@@ -159,6 +163,8 @@ pub struct ProxyConfig {
     pub anthropic_source: String,
     #[serde(default = "default_proxy_kimi_source")]
     pub kimi_source: String,
+    #[serde(default = "default_proxy_mimo_source")]
+    pub mimo_source: String,
     #[serde(default = "default_proxy_source_header")]
     pub source_header: String,
     #[serde(default = "default_proxy_upstream_base_url_header")]
@@ -166,7 +172,10 @@ pub struct ProxyConfig {
     pub upstream_base_url: Option<String>,
     pub anthropic_upstream_base_url: Option<String>,
     pub kimi_upstream_base_url: Option<String>,
+    pub mimo_upstream_base_url: Option<String>,
     pub api_key: Option<String>,
+    pub mimo_api_key: Option<String>,
+    pub mimo_upstream_model: Option<String>,
     #[serde(default = "default_proxy_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -212,12 +221,16 @@ impl Default for ProxyConfig {
             source: default_proxy_source(),
             anthropic_source: default_proxy_anthropic_source(),
             kimi_source: default_proxy_kimi_source(),
+            mimo_source: default_proxy_mimo_source(),
             source_header: default_proxy_source_header(),
             upstream_base_url_header: default_proxy_upstream_base_url_header(),
             upstream_base_url: None,
             anthropic_upstream_base_url: None,
             kimi_upstream_base_url: None,
+            mimo_upstream_base_url: None,
             api_key: None,
+            mimo_api_key: None,
+            mimo_upstream_model: None,
             timeout_secs: default_proxy_timeout_secs(),
         }
     }
@@ -345,6 +358,14 @@ fn default_remote_state_ttl_ms() -> u64 {
     120_000
 }
 
+fn default_output_busy_state_ttl_ms() -> u64 {
+    0
+}
+
+fn default_output_refresh_interval_ms() -> u64 {
+    30_000
+}
+
 fn default_proxy_source() -> String {
     "hermes-agent".to_string()
 }
@@ -355,6 +376,10 @@ fn default_proxy_anthropic_source() -> String {
 
 fn default_proxy_kimi_source() -> String {
     "vscode-kimi-code".to_string()
+}
+
+fn default_proxy_mimo_source() -> String {
+    "mimo-code".to_string()
 }
 
 fn default_proxy_source_header() -> String {

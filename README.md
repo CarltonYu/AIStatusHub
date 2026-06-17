@@ -70,13 +70,28 @@ The monitor reads Codex's local `sessions` directory and treats recent session
 file updates as AI activity. It only reports busy/idle transitions, so it stays
 small and does not store conversation content.
 
-Hermes Agent can be tested by enabling `[proxy]` in AIStatusHub config, then pointing Hermes at `http://127.0.0.1:17888/v1`:
+Hermes Agent can be tested by enabling `[proxy]` in AIStatusHub config. When
+Hermes runs inside the `HermesUbuntu` WSL distro and AIStatusHub runs on
+Windows, set `server.host = "0.0.0.0"` and point Hermes at the Windows WSL
+gateway address, for example `http://172.28.96.1:17888/v1`:
+
+```powershell
+.\install-hermes-command.bat
+```
+
+The installer creates global `hermes` and `hermes-tui` commands in
+`%USERPROFILE%\.local\bin`. They launch the Hermes WSL distro from the current
+Windows console directory, so `hermes` opened in a project folder uses that
+folder as its working directory.
 
 ```bash
 hermes config set model.provider custom
-hermes config set model.base_url http://127.0.0.1:17888/v1
+hermes config set model.base_url http://172.28.96.1:17888/v1
 hermes config set model.default mimo-v2.5-pro
 ```
+
+If the WSL gateway changes, check it with
+`wsl -d HermesUbuntu -- ip route show default` and use the `default via` IP.
 
 If AIStatusHub `proxy.api_key` is empty, Hermes must send a Bearer token, for example through `OPENAI_API_KEY` in `~/.hermes/.env`.
 
@@ -128,6 +143,11 @@ The console font is set to `fbcon=font:6x8` for the 240×320 ST7789V screen.
 
 A cross-host helper `duo-console` is provided in `tools/duo-console/`. After
 installation you can type commands directly instead of piping through `nc`:
+
+```powershell
+# Windows
+.\install-duo-console.bat
+```
 
 ```bash
 # One-shot
